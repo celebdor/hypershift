@@ -15,19 +15,6 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	imagev1 "github.com/openshift/api/image/v1"
 	routev1 "github.com/openshift/api/route/v1"
-	"github.com/openshift/hypershift/api"
-	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/autoscaler"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/common"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/imageprovider"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/ingress"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
-	fakecapabilities "github.com/openshift/hypershift/support/capabilities/fake"
-	"github.com/openshift/hypershift/support/config"
-	"github.com/openshift/hypershift/support/releaseinfo"
-	fakereleaseprovider "github.com/openshift/hypershift/support/releaseinfo/fake"
-	"github.com/openshift/hypershift/support/testutil"
-	"github.com/openshift/hypershift/support/util"
 	"go.uber.org/zap/zaptest"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -48,10 +35,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/runtime/inject"
 	"sigs.k8s.io/yaml"
 
+	"github.com/openshift/hypershift/api"
+	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/autoscaler"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/common"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/imageprovider"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/ingress"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/oauth"
+	fakecapabilities "github.com/openshift/hypershift/support/capabilities/fake"
+	"github.com/openshift/hypershift/support/config"
+	"github.com/openshift/hypershift/support/releaseinfo"
+	fakereleaseprovider "github.com/openshift/hypershift/support/releaseinfo/fake"
+	"github.com/openshift/hypershift/support/testutil"
+	"github.com/openshift/hypershift/support/util"
 )
 
 type fakeEC2Client struct {
@@ -957,11 +956,12 @@ func TestEventHandling(t *testing.T) {
 	}
 	restMapper := meta.NewDefaultRESTMapper(nil)
 	restMapper.Add(hcpGVK, meta.RESTScopeNamespace)
-	c := &createTrackingClient{Client: fake.NewClientBuilder().
-		WithScheme(api.Scheme).
-		WithObjects(hcp, pullSecret, etcdEncryptionKey, fakeNodeTuningOperator, fakeNodeTuningOperatorTLS).
-		WithRESTMapper(restMapper).
-		Build(),
+	c := &createTrackingClient{
+		Client: fake.NewClientBuilder().
+			WithScheme(api.Scheme).
+			WithObjects(hcp, pullSecret, etcdEncryptionKey, fakeNodeTuningOperator, fakeNodeTuningOperatorTLS).
+			WithRESTMapper(restMapper).
+			Build(),
 	}
 
 	readyInfraStatus := InfrastructureStatus{
@@ -1014,16 +1014,16 @@ func TestEventHandling(t *testing.T) {
 				t.Fatalf("reconciler creates %T but has no handler for them", createdObject)
 			}
 
-			if injectScheme, ok := handler.(inject.Scheme); ok {
-				if err := injectScheme.InjectScheme(api.Scheme); err != nil {
-					t.Fatalf("failed to inject scheme into handler: %v", err)
-				}
-			}
-			if injectMapper, ok := handler.(inject.Mapper); ok {
-				if err := injectMapper.InjectMapper(c.RESTMapper()); err != nil {
-					t.Fatalf("failed to inject mapper into handler: %v", err)
-				}
-			}
+			//if injectScheme, ok := handler.(inject.Scheme); ok {
+			//	if err := injectScheme.InjectScheme(api.Scheme); err != nil {
+			//		t.Fatalf("failed to inject scheme into handler: %v", err)
+			//	}
+			//}
+			//if injectMapper, ok := handler.(inject.Mapper); ok {
+			//	if err := injectMapper.InjectMapper(c.RESTMapper()); err != nil {
+			//		t.Fatalf("failed to inject mapper into handler: %v", err)
+			//	}
+			//}
 
 			fakeQueue := &createTrackingWorkqueue{}
 			handler.Create(event.CreateEvent{Object: createdObject}, fakeQueue)

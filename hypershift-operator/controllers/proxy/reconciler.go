@@ -19,7 +19,6 @@ import (
 )
 
 func Setup(mgr manager.Manager, deploymentNamespace string, deploymentName string) error {
-
 	// We do not want this controller to require leader election, as that slows things down drastically when there is a proxy
 	// and if we have multiple instances running, they should all attempt to do the same change. This means we can not use
 	// the builder and have to wrap the controller.
@@ -33,7 +32,8 @@ func Setup(mgr manager.Manager, deploymentNamespace string, deploymentName strin
 	if err != nil {
 		return fmt.Errorf("failed to construct controller: %w", err)
 	}
-	if err := c.Watch(&source.Kind{Type: &configv1.Proxy{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err := c.Watch(source.Kind(mgr.GetCache(), &configv1.Proxy{}),
+		&handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("failed to set up watch for %T: %w", &configv1.Proxy{}, err)
 	}
 	if err := mgr.Add(&noLeaderElectionRunnable{c}); err != nil {

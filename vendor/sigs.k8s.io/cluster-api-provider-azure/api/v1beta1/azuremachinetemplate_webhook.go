@@ -32,8 +32,9 @@ import (
 
 // AzureMachineTemplateImmutableMsg ...
 const (
-	AzureMachineTemplateImmutableMsg          = "AzureMachineTemplate spec.template.spec field is immutable. Please create new resource instead. ref doc: https://cluster-api.sigs.k8s.io/tasks/updating-machine-templates.html"
-	AzureMachineTemplateRoleAssignmentNameMsg = "AzureMachineTemplate spec.template.spec.roleAssignmentName field can't be set"
+	AzureMachineTemplateImmutableMsg                      = "AzureMachineTemplate spec.template.spec field is immutable. Please create new resource instead. ref doc: https://cluster-api.sigs.k8s.io/tasks/updating-machine-templates.html"
+	AzureMachineTemplateRoleAssignmentNameMsg             = "AzureMachineTemplate spec.template.spec.roleAssignmentName field can't be set"
+	AzureMachineTemplateSystemAssignedIdentityRoleNameMsg = "AzureMachineTemplate spec.template.spec.systemAssignedIdentityRole.name field can't be set"
 )
 
 // SetupWebhookWithManager sets up and registers the webhook with the manager.
@@ -52,7 +53,7 @@ var _ webhook.CustomDefaulter = &AzureMachineTemplate{}
 var _ webhook.CustomValidator = &AzureMachineTemplate{}
 
 // ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type.
-func (r *AzureMachineTemplate) ValidateCreate(ctx context.Context, obj runtime.Object) error {
+func (r *AzureMachineTemplate) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
 	t := obj.(*AzureMachineTemplate)
 	spec := t.Spec.Template.Spec
 
@@ -64,22 +65,42 @@ func (r *AzureMachineTemplate) ValidateCreate(ctx context.Context, obj runtime.O
 		)
 	}
 
-	if len(allErrs) == 0 {
-		return nil
+	if spec.SystemAssignedIdentityRole != nil && spec.SystemAssignedIdentityRole.Name != "" {
+		allErrs = append(allErrs,
+			field.Invalid(field.NewPath("AzureMachineTemplate", "spec", "template", "spec", "systemAssignedIdentityRole", "name"), t, AzureMachineTemplateSystemAssignedIdentityRoleNameMsg),
+		)
 	}
 
-	return apierrors.NewInvalid(GroupVersion.WithKind("AzureMachineTemplate").GroupKind(), t.Name, allErrs)
+	if (r.Spec.Template.Spec.NetworkInterfaces != nil) && len(r.Spec.Template.Spec.NetworkInterfaces) > 0 && r.Spec.Template.Spec.SubnetName != "" {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("AzureMachineTemplate", "spec", "template", "spec", "networkInterfaces"), r.Spec.Template.Spec.NetworkInterfaces, "cannot set both NetworkInterfaces and machine SubnetName"))
+	}
+
+	if (r.Spec.Template.Spec.NetworkInterfaces != nil) && len(r.Spec.Template.Spec.NetworkInterfaces) > 0 && r.Spec.Template.Spec.AcceleratedNetworking != nil {
+		allErrs = append(allErrs, field.Invalid(field.NewPath("AzureMachineTemplate", "spec", "template", "spec", "acceleratedNetworking"), r.Spec.Template.Spec.NetworkInterfaces, "cannot set both NetworkInterfaces and machine AcceleratedNetworking"))
+	}
+
+	for i, networkInterface := range r.Spec.Template.Spec.NetworkInterfaces {
+		if networkInterface.PrivateIPConfigs < 1 {
+			allErrs = append(allErrs, field.Invalid(field.NewPath("AzureMachineTemplate", "spec", "template", "spec", "networkInterfaces", "privateIPConfigs"), r.Spec.Template.Spec.NetworkInterfaces[i].PrivateIPConfigs, "networkInterface privateIPConfigs must be set to a minimum value of 1"))
+		}
+	}
+
+	if len(allErrs) == 0 {
+		return nil, nil
+	}
+
+	return nil, apierrors.NewInvalid(GroupVersion.WithKind("AzureMachineTemplate").GroupKind(), t.Name, allErrs)
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
-func (r *AzureMachineTemplate) ValidateUpdate(ctx context.Context, oldRaw runtime.Object, newRaw runtime.Object) error {
+func (r *AzureMachineTemplate) ValidateUpdate(ctx context.Context, oldRaw runtime.Object, newRaw runtime.Object) (admission.Warnings, error) {
 	var allErrs field.ErrorList
 	old := oldRaw.(*AzureMachineTemplate)
 	t := newRaw.(*AzureMachineTemplate)
 
 	req, err := admission.RequestFromContext(ctx)
 	if err != nil {
-		return apierrors.NewBadRequest(fmt.Sprintf("expected a admission.Request inside context: %v", err))
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a admission.Request inside context: %v", err))
 	}
 
 	if !topology.ShouldSkipImmutabilityChecks(req, t) &&
@@ -110,14 +131,14 @@ func (r *AzureMachineTemplate) ValidateUpdate(ctx context.Context, oldRaw runtim
 	}
 
 	if len(allErrs) == 0 {
-		return nil
+		return nil, nil
 	}
-	return apierrors.NewInvalid(GroupVersion.WithKind("AzureMachineTemplate").GroupKind(), t.Name, allErrs)
+	return nil, apierrors.NewInvalid(GroupVersion.WithKind("AzureMachineTemplate").GroupKind(), t.Name, allErrs)
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
-func (r *AzureMachineTemplate) ValidateDelete(ctx context.Context, obj runtime.Object) error {
-	return nil
+func (r *AzureMachineTemplate) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	return nil, nil
 }
 
 // Default implements webhookutil.defaulter so a webhook will be registered for the type.
@@ -128,5 +149,6 @@ func (r *AzureMachineTemplate) Default(ctx context.Context, obj runtime.Object) 
 	}
 	t.Spec.Template.Spec.SetDefaultCachingType()
 	t.Spec.Template.Spec.SetDataDisksDefaults()
+	t.Spec.Template.Spec.SetNetworkInterfacesDefaults()
 	return nil
 }

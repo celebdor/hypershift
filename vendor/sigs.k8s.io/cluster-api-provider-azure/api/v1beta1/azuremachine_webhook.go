@@ -17,47 +17,73 @@ limitations under the License.
 package v1beta1
 
 import (
+	"context"
+	"reflect"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	webhookutils "sigs.k8s.io/cluster-api-provider-azure/util/webhook"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
-// SetupWebhookWithManager sets up and registers the webhook with the manager.
-func (m *AzureMachine) SetupWebhookWithManager(mgr ctrl.Manager) error {
+// SetupAzureMachineWebhookWithManager sets up and registers the webhook with the manager.
+func SetupAzureMachineWebhookWithManager(mgr ctrl.Manager) error {
+	mw := &azureMachineWebhook{Client: mgr.GetClient()}
 	return ctrl.NewWebhookManagedBy(mgr).
-		For(m).
+		For(&AzureMachine{}).
+		WithDefaulter(mw).
+		WithValidator(mw).
 		Complete()
 }
 
 // +kubebuilder:webhook:verbs=create;update,path=/validate-infrastructure-cluster-x-k8s-io-v1beta1-azuremachine,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=infrastructure.cluster.x-k8s.io,resources=azuremachines,versions=v1beta1,name=validation.azuremachine.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
 // +kubebuilder:webhook:verbs=create;update,path=/mutate-infrastructure-cluster-x-k8s-io-v1beta1-azuremachine,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,groups=infrastructure.cluster.x-k8s.io,resources=azuremachines,versions=v1beta1,name=default.azuremachine.infrastructure.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
 
-var _ webhook.Validator = &AzureMachine{}
+// azureMachineWebhook implements a validating and defaulting webhook for AzureMachines.
+type azureMachineWebhook struct {
+	Client client.Client
+}
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type.
-func (m *AzureMachine) ValidateCreate() error {
+func (mw *azureMachineWebhook) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	m, ok := obj.(*AzureMachine)
+	if !ok {
+		return nil, apierrors.NewBadRequest("expected an AzureMachine resource")
+	}
 	spec := m.Spec
 
 	allErrs := ValidateAzureMachineSpec(spec)
 
-	if errs := ValidateSystemAssignedIdentity(spec.Identity, "", spec.RoleAssignmentName, field.NewPath("roleAssignmentName")); len(errs) > 0 {
+	roleAssignmentName := ""
+	if spec.SystemAssignedIdentityRole != nil {
+		roleAssignmentName = spec.SystemAssignedIdentityRole.Name
+	}
+
+	if errs := ValidateSystemAssignedIdentity(spec.Identity, "", roleAssignmentName, field.NewPath("roleAssignmentName")); len(errs) > 0 {
 		allErrs = append(allErrs, errs...)
 	}
 
 	if len(allErrs) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	return apierrors.NewInvalid(GroupVersion.WithKind("AzureMachine").GroupKind(), m.Name, allErrs)
+	return nil, apierrors.NewInvalid(GroupVersion.WithKind("AzureMachine").GroupKind(), m.Name, allErrs)
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
-func (m *AzureMachine) ValidateUpdate(oldRaw runtime.Object) error {
+func (mw *azureMachineWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
 	var allErrs field.ErrorList
-	old := oldRaw.(*AzureMachine)
+	old, ok := oldObj.(*AzureMachine)
+	if !ok {
+		return nil, apierrors.NewBadRequest("expected an AzureMachine resource")
+	}
+	m, ok := newObj.(*AzureMachine)
+	if !ok {
+		return nil, apierrors.NewBadRequest("expected an AzureMachine resource")
+	}
 
 	if err := webhookutils.ValidateImmutable(
 		field.NewPath("Spec", "Image"),
@@ -70,6 +96,13 @@ func (m *AzureMachine) ValidateUpdate(oldRaw runtime.Object) error {
 		field.NewPath("Spec", "Identity"),
 		old.Spec.Identity,
 		m.Spec.Identity); err != nil {
+		allErrs = append(allErrs, err)
+	}
+
+	if err := webhookutils.ValidateImmutable(
+		field.NewPath("Spec", "SystemAssignedIdentityRole"),
+		old.Spec.SystemAssignedIdentityRole,
+		m.Spec.SystemAssignedIdentityRole); err != nil {
 		allErrs = append(allErrs, err)
 	}
 
@@ -122,7 +155,10 @@ func (m *AzureMachine) ValidateUpdate(oldRaw runtime.Object) error {
 		allErrs = append(allErrs, err)
 	}
 
-	if err := webhookutils.ValidateImmutable(
+	// Spec.AcceleratedNetworking can only be reset to nil and no other changes apart from that
+	// is accepted if the field is set.
+	// Ref issue #3518
+	if err := webhookutils.ValidateZeroTransition(
 		field.NewPath("Spec", "AcceleratedNetworking"),
 		old.Spec.AcceleratedNetworking,
 		m.Spec.AcceleratedNetworking); err != nil {
@@ -143,18 +179,49 @@ func (m *AzureMachine) ValidateUpdate(oldRaw runtime.Object) error {
 		allErrs = append(allErrs, err)
 	}
 
-	if len(allErrs) == 0 {
-		return nil
+	if old.Spec.Diagnostics != nil {
+		if err := webhookutils.ValidateImmutable(
+			field.NewPath("Spec", "Diagnostics"),
+			old.Spec.Diagnostics,
+			m.Spec.Diagnostics); err != nil {
+			allErrs = append(allErrs, err)
+		}
 	}
-	return apierrors.NewInvalid(GroupVersion.WithKind("AzureMachine").GroupKind(), m.Name, allErrs)
+
+	if !reflect.DeepEqual(m.Spec.NetworkInterfaces, old.Spec.NetworkInterfaces) {
+		// The defaulting webhook may have migrated values from the old SubnetName field to the new NetworkInterfaces format.
+		old.Spec.SetNetworkInterfacesDefaults()
+
+		// The reconciler will populate the SubnetName on the first interface if the user left it blank.
+		if old.Spec.NetworkInterfaces[0].SubnetName == "" && m.Spec.NetworkInterfaces[0].SubnetName != "" {
+			old.Spec.NetworkInterfaces[0].SubnetName = m.Spec.NetworkInterfaces[0].SubnetName
+		}
+
+		// Enforce immutability for all other changes to NetworkInterfaces.
+		if !reflect.DeepEqual(m.Spec.NetworkInterfaces, old.Spec.NetworkInterfaces) {
+			allErrs = append(allErrs,
+				field.Invalid(field.NewPath("spec", "networkInterfaces"),
+					m.Spec.NetworkInterfaces, "field is immutable"),
+			)
+		}
+	}
+
+	if len(allErrs) == 0 {
+		return nil, nil
+	}
+	return nil, apierrors.NewInvalid(GroupVersion.WithKind("AzureMachine").GroupKind(), m.Name, allErrs)
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
-func (m *AzureMachine) ValidateDelete() error {
-	return nil
+func (mw *azureMachineWebhook) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	return nil, nil
 }
 
-// Default implements webhookutil.defaulter so a webhook will be registered for the type.
-func (m *AzureMachine) Default() {
-	m.Spec.SetDefaults()
+// Default implements webhook.Defaulter so a webhook will be registered for the type.
+func (mw *azureMachineWebhook) Default(ctx context.Context, obj runtime.Object) error {
+	m, ok := obj.(*AzureMachine)
+	if !ok {
+		return apierrors.NewBadRequest("expected an AzureMachine resource")
+	}
+	return m.SetDefaults(mw.Client)
 }

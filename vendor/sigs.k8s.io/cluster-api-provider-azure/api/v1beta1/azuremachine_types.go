@@ -62,12 +62,15 @@ type AzureMachineSpec struct {
 	// UserAssignedIdentities is a list of standalone Azure identities provided by the user
 	// The lifecycle of a user-assigned identity is managed separately from the lifecycle of
 	// the AzureMachine.
-	// See https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/how-to-manage-ua-identity-cli
+	// See https://learn.microsoft.com/azure/active-directory/managed-identities-azure-resources/how-to-manage-ua-identity-cli
 	// +optional
 	UserAssignedIdentities []UserAssignedIdentity `json:"userAssignedIdentities,omitempty"`
 
-	// RoleAssignmentName is the name of the role assignment to create for a system assigned identity. It can be any valid GUID.
-	// If not specified, a random GUID will be generated.
+	// SystemAssignedIdentityRole defines the role and scope to assign to the system-assigned identity.
+	// +optional
+	SystemAssignedIdentityRole *SystemAssignedIdentityRole `json:"systemAssignedIdentityRole,omitempty"`
+
+	// Deprecated: RoleAssignmentName should be set in the systemAssignedIdentityRole field.
 	// +optional
 	RoleAssignmentName string `json:"roleAssignmentName,omitempty"`
 
@@ -78,6 +81,9 @@ type AzureMachineSpec struct {
 	// +optional
 	DataDisks []DataDisk `json:"dataDisks,omitempty"`
 
+	// SSHPublicKey is the SSH public key string, base64-encoded to add to a Virtual Machine. Linux only.
+	// Refer to documentation on how to set up SSH access on Windows instances.
+	// +optional
 	SSHPublicKey string `json:"sshPublicKey"`
 
 	// AdditionalTags is an optional set of tags to add to an instance, in addition to the ones added by default by the
@@ -100,12 +106,15 @@ type AzureMachineSpec struct {
 	// +optional
 	EnableIPForwarding bool `json:"enableIPForwarding,omitempty"`
 
-	// AcceleratedNetworking enables or disables Azure accelerated networking. If omitted, it will be set based on
-	// whether the requested VMSize supports accelerated networking.
-	// If AcceleratedNetworking is set to true with a VMSize that does not support it, Azure will return an error.
+	// Deprecated: AcceleratedNetworking should be set in the networkInterfaces field.
 	// +kubebuilder:validation:nullable
 	// +optional
 	AcceleratedNetworking *bool `json:"acceleratedNetworking,omitempty"`
+
+	// Diagnostics specifies the diagnostics settings for a virtual machine.
+	// If not specified then Boot diagnostics (Managed) will be enabled.
+	// +optional
+	Diagnostics *Diagnostics `json:"diagnostics,omitempty"`
 
 	// SpotVMOptions allows the ability to specify the Machine should use a Spot VM
 	// +optional
@@ -115,7 +124,7 @@ type AzureMachineSpec struct {
 	// +optional
 	SecurityProfile *SecurityProfile `json:"securityProfile,omitempty"`
 
-	// SubnetName selects the Subnet where the VM will be placed
+	// Deprecated: SubnetName should be set in the networkInterfaces field.
 	// +optional
 	SubnetName string `json:"subnetName,omitempty"`
 
@@ -126,6 +135,13 @@ type AzureMachineSpec struct {
 	// VMExtensions specifies a list of extensions to be added to the virtual machine.
 	// +optional
 	VMExtensions []VMExtension `json:"vmExtensions,omitempty"`
+
+	// NetworkInterfaces specifies a list of network interface configurations.
+	// If left unspecified, the VM will get a single network interface with a
+	// single IPConfig in the subnet specified in the cluster's node subnet field.
+	// The primary interface will be the first networkInterface specified (index 0) in the list.
+	// +optional
+	NetworkInterfaces []NetworkInterface `json:"networkInterfaces,omitempty"`
 }
 
 // SpotVMOptions defines the options relevant to running the Machine on Spot VMs.
@@ -137,6 +153,24 @@ type SpotVMOptions struct {
 	// EvictionPolicy defines the behavior of the virtual machine when it is evicted. It can be either Delete or Deallocate.
 	// +optional
 	EvictionPolicy *SpotEvictionPolicy `json:"evictionPolicy,omitempty"`
+}
+
+// SystemAssignedIdentityRole defines the role and scope to assign to the system assigned identity.
+type SystemAssignedIdentityRole struct {
+	// Name is the name of the role assignment to create for a system assigned identity. It can be any valid UUID.
+	// If not specified, a random UUID will be generated.
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// DefinitionID is the ID of the role definition to create for a system assigned identity. It can be an Azure built-in role or a custom role.
+	// Refer to built-in roles: https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles
+	// +optional
+	DefinitionID string `json:"definitionID,omitempty"`
+
+	// Scope is the scope that the role assignment or definition applies to. The scope can be any REST resource instance.
+	// If not specified, the scope will be the subscription.
+	// +optional
+	Scope string `json:"scope,omitempty"`
 }
 
 // AzureMachineStatus defines the observed state of AzureMachine.
@@ -219,6 +253,7 @@ type AdditionalCapabilities struct {
 // +kubebuilder:printcolumn:name="Machine",type="string",priority=1,JSONPath=".metadata.ownerReferences[?(@.kind==\"Machine\")].name",description="Machine object to which this AzureMachine belongs"
 // +kubebuilder:printcolumn:name="VM ID",type="string",priority=1,JSONPath=".spec.providerID",description="Azure VM ID"
 // +kubebuilder:printcolumn:name="VM Size",type="string",priority=1,JSONPath=".spec.vmSize",description="Azure VM Size"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since creation of this AzureMachine"
 // +kubebuilder:resource:path=azuremachines,scope=Namespaced,categories=cluster-api
 // +kubebuilder:storageversion
 // +kubebuilder:subresource:status
