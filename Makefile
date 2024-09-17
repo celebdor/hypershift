@@ -52,8 +52,18 @@ build: hypershift-operator control-plane-operator control-plane-pki-operator hyp
 .PHONY: update
 update: api-deps api api-docs deps clients
 
+.PHONY: golang-lint
+golang-lint:
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v1.61.0
+	./bin/golangci-lint run --config ./.golangci.yml
+
+.PHONY: golang-lint-fix
+golang-lint-fix:
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v1.61.0
+	./bin/golangci-lint run --config ./.golangci.yml --fix
+
 .PHONY: verify
-verify: update staticcheck fmt vet
+verify: update staticcheck fmt vet golang-lint
 	git diff-index --cached --quiet --ignore-submodules HEAD --
 	git diff-files --quiet --ignore-submodules
 	git diff --exit-code HEAD --
