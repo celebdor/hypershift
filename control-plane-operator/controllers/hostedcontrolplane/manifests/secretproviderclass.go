@@ -2,9 +2,11 @@ package manifests
 
 import (
 	"fmt"
+
 	"github.com/openshift/hypershift/support/azureutil"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	secretsstorev1 "sigs.k8s.io/secrets-store-csi-driver/apis/v1"
 )
 

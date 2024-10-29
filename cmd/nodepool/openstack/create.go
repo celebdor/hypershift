@@ -7,9 +7,10 @@ import (
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/cmd/nodepool/core"
 
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func DefaultOptions() *RawOpenStackPlatformCreateOptions {

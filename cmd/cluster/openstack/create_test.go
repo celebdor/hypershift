@@ -11,9 +11,11 @@ import (
 	"github.com/openshift/hypershift/support/certs"
 	"github.com/openshift/hypershift/support/testutil"
 	"github.com/openshift/hypershift/test/integration/framework"
+
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
+
 	"github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
-	utilrand "k8s.io/apimachinery/pkg/util/rand"
 )
 
 func TestCreateOptions_Validate(t *testing.T) {

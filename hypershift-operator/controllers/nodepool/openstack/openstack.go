@@ -6,6 +6,7 @@ import (
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 
 	"k8s.io/utils/ptr"
+
 	capiopenstack "sigs.k8s.io/cluster-api-provider-openstack/api/v1beta1"
 )
 

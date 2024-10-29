@@ -7,7 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
+	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
+	supportawsutil "github.com/openshift/hypershift/support/awsutil"
+	"github.com/openshift/hypershift/support/config"
+	"github.com/openshift/hypershift/support/upsert"
+	"github.com/openshift/hypershift/support/util"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -39,13 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
-	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
-	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
-	supportawsutil "github.com/openshift/hypershift/support/awsutil"
-	"github.com/openshift/hypershift/support/config"
-	"github.com/openshift/hypershift/support/upsert"
-	"github.com/openshift/hypershift/support/util"
+	"github.com/go-logr/logr"
 )
 
 const (

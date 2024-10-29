@@ -13,12 +13,15 @@ import (
 	"github.com/openshift/hypershift/cmd/util"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
-	"github.com/spf13/cobra"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/errors"
+
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/spf13/cobra"
 )
 
 func NewDestroyCommand(opts *core.DestroyOptions) *cobra.Command {

@@ -1,10 +1,11 @@
 package azureutil
 
 import (
-	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"testing"
 
 	. "github.com/onsi/gomega"
+
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 )
 
 func TestGetSubnetNameFromSubnetID(t *testing.T) {
