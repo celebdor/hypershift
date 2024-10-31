@@ -14,6 +14,7 @@ BIN_DIR=bin
 TOOLS_BIN_DIR := $(TOOLS_DIR)/$(BIN_DIR)
 CONTROLLER_GEN := $(abspath $(TOOLS_BIN_DIR)/controller-gen)
 CODE_GEN := $(abspath $(TOOLS_BIN_DIR)/codegen)
+GOLANGCI_LINT := $(abspath $(TOOLS_BIN_DIR)/golangci-lint)
 STATICCHECK := $(abspath $(TOOLS_BIN_DIR)/staticcheck)
 GENAPIDOCS := $(abspath $(TOOLS_BIN_DIR)/gen-crd-api-reference-docs)
 
@@ -52,15 +53,16 @@ build: hypershift-operator control-plane-operator control-plane-pki-operator hyp
 .PHONY: update
 update: api-deps api api-docs deps clients
 
+$(GOLANGCI_LINT):$(TOOLS_DIR)/go.mod # Build golangci-lint from tools folder.
+	cd $(TOOLS_DIR); GO111MODULE=on GOFLAGS=-mod=vendor GOWORK=off go build -tags=tools -o $(GOLANGCI_LINT) github.com/golangci/golangci-lint/cmd/golangci-lint
+
 .PHONY: golang-lint
-golang-lint:
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v1.61.0
-	./bin/golangci-lint run --config ./.golangci.yml
+golang-lint: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run --config ./.golangci.yml
 
 .PHONY: golang-lint-fix
 golang-lint-fix:
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s v1.61.0
-	./bin/golangci-lint run --config ./.golangci.yml --fix
+	$(GOLANGCI_LINT) run --config ./.golangci.yml --fix
 
 .PHONY: verify
 verify: update staticcheck fmt vet golang-lint
