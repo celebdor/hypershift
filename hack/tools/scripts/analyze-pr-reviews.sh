@@ -106,6 +106,12 @@ while IFS='|' read -r repo pr_number title author url; do
     COUNT=$((COUNT + 1))
     echo "Checking $COUNT/$TOTAL_PRS: $repo#$pr_number..." >&2
 
+    # Rate limiting: sleep briefly every 10 requests
+    if [ $((COUNT % 10)) -eq 0 ]; then
+        echo "Rate limit pause..." >&2
+        sleep 2
+    fi
+
     # Get reviews and check if any were submitted in date range
     REVIEW_ITEMS=$(gh pr view "$pr_number" --repo "$repo" --json reviews 2>/dev/null | \
         jq -r --arg user "$GITHUB_USER" \
@@ -152,34 +158,46 @@ echo ""
 echo ""
 echo "=== DETAILED REVIEWS ==="
 
+REVIEW_COUNT=0
 while IFS='|' read -r repo pr_number; do
     [ -z "$repo" ] && continue
 
     echo "=== PR $repo#$pr_number ==="
 
+    # Rate limiting
+    REVIEW_COUNT=$((REVIEW_COUNT + 1))
+    if [ $((REVIEW_COUNT % 10)) -eq 0 ]; then
+        sleep 2
+    fi
+
     # Get review comments
-    gh pr view "$pr_number" --repo "$repo" --json number,title,reviews --jq \
-        --arg user "$GITHUB_USER" \
-        '.reviews[] | select(.author.login == $user) | {state: .state, submittedAt: .submittedAt, bodyText: .body}' 2>/dev/null || echo "No reviews found"
+    gh pr view "$pr_number" --repo "$repo" --json reviews 2>/dev/null | \
+        jq -r --arg user "$GITHUB_USER" \
+        '.reviews[] | select(.author.login == $user) | {state: .state, submittedAt: .submittedAt, body: .body}' 2>/dev/null || echo "No reviews found"
 
     echo ""
 done <<< "$PR_DATA"
 
 echo ""
-echo "=== INLINE COMMENTS SAMPLE ==="
+echo "=== INLINE COMMENTS ==="
 
-# Sample a few PRs for inline comments (first 10)
-SAMPLE_PR_DATA=$(echo "$PR_DATA" | head -10)
-
+# Get all inline comments for all PRs (for comprehensive categorization analysis)
+INLINE_COUNT=0
 while IFS='|' read -r repo pr_number; do
     [ -z "$repo" ] && continue
 
     echo "=== PR $repo#$pr_number inline comments ==="
 
-    # Get inline comments - dynamically use the repository from the PR data
+    # Rate limiting
+    INLINE_COUNT=$((INLINE_COUNT + 1))
+    if [ $((INLINE_COUNT % 10)) -eq 0 ]; then
+        sleep 2
+    fi
+
+    # Get all inline comments - dynamically use the repository from the PR data
     gh api "/repos/$repo/pulls/$pr_number/comments" --jq \
         --arg user "$GITHUB_USER" \
-        '.[] | select(.user.login == $user) | {body: .body, path: .path}' 2>/dev/null | head -5 || echo "No inline comments"
+        '.[] | select(.user.login == $user) | {body: .body, path: .path, line: .line}' 2>/dev/null || echo "No inline comments"
 
     echo ""
-done <<< "$SAMPLE_PR_DATA"
+done <<< "$PR_DATA"
