@@ -71,8 +71,8 @@ class JiraContributionAnalyzer:
         self.end_date = end_date
         self.github_prs = github_prs or []
 
-        # Extract Jira username from email (before @)
-        self.jira_username = email.split("@")[0] if "@" in email else email
+        # Jira username will be discovered from API responses
+        self.jira_username: Optional[str] = None
 
         # Results storage
         self.tickets_reported: List[Dict] = []
@@ -290,6 +290,29 @@ class JiraContributionAnalyzer:
         except Exception:
             return False
 
+    def _discover_jira_username(self, issues: List[Dict]) -> None:
+        """Discover the Jira username from API responses."""
+        if self.jira_username:
+            return  # Already discovered
+
+        for issue in issues:
+            fields = issue.get("fields", {})
+
+            # Check reporter
+            reporter = fields.get("reporter", {})
+            if reporter and reporter.get("emailAddress") == self.email:
+                # The 'name' field contains the Jira username
+                self.jira_username = reporter.get("name")
+                print(f"  Discovered Jira username: {self.jira_username}", file=sys.stderr)
+                return
+
+            # Check assignee
+            assignee = fields.get("assignee", {})
+            if assignee and assignee.get("emailAddress") == self.email:
+                self.jira_username = assignee.get("name")
+                print(f"  Discovered Jira username: {self.jira_username}", file=sys.stderr)
+                return
+
     async def fetch_tickets_reported(self) -> None:
         """Fetch tickets reported by the developer in the date range."""
         print(f"Fetching tickets reported by {self.email}...", file=sys.stderr)
@@ -300,6 +323,9 @@ class JiraContributionAnalyzer:
 
         # Expand changelog to avoid separate requests later
         issues = await self._search_issues(jql, max_results=500, expand="changelog")
+
+        # Discover Jira username from the response
+        self._discover_jira_username(issues)
 
         for issue in issues:
             issue_data = self._extract_issue_data(issue)
@@ -319,6 +345,9 @@ class JiraContributionAnalyzer:
         # Expand changelog to avoid separate requests later
         issues = await self._search_issues(jql, max_results=500, expand="changelog")
 
+        # Try to discover Jira username if not found from reported tickets
+        self._discover_jira_username(issues)
+
         for issue in issues:
             issue_data = self._extract_issue_data(issue)
             # Extract inline changelog activity
@@ -328,18 +357,25 @@ class JiraContributionAnalyzer:
         print(f"  Found {len(self.tickets_closed)} tickets closed", file=sys.stderr)
 
     async def fetch_tickets_verified(self) -> None:
-        """Fetch tickets verified by the developer (moved to Verified status).
+        """Fetch tickets verified/closed by the developer.
 
-        Uses JQL 'status CHANGED TO Verified BY user' to avoid fetching changelogs individually.
+        Uses JQL 'status CHANGED TO X BY user' to avoid fetching changelogs individually.
+        Note: OCPBUGS uses "Verified" status, CNTRLPLANE uses "Closed" status.
+        Note: JQL BY clause needs username (e.g., "sjenning"), not email.
         """
-        print(f"Fetching tickets verified by {self.email}...", file=sys.stderr)
+        print(f"Fetching tickets verified/closed by {self.email}...", file=sys.stderr)
 
-        # Use JQL to find tickets where this user changed status to Verified
-        # This is MUCH more efficient than fetching changelogs for each Verified ticket
-        projects_clause = " OR ".join([f'project = "{p}"' for p in JIRA_PROJECTS])
+        if not self.jira_username:
+            print("  Skipping: Could not discover Jira username from previous queries", file=sys.stderr)
+            return
+
+        # Combined query for both projects with their respective terminal statuses
+        # Note: AFTER/BEFORE must be part of each CHANGED clause, not separate
         jql = (
-            f'({projects_clause}) AND status CHANGED TO Verified BY "{self.email}" '
-            f'AFTER "{self.start_date}" BEFORE "{self.end_date}" ORDER BY updated DESC'
+            f'(project = OCPBUGS AND status CHANGED TO Verified BY "{self.jira_username}" '
+            f'AFTER "{self.start_date}" BEFORE "{self.end_date}") OR '
+            f'(project = CNTRLPLANE AND status CHANGED TO Closed BY "{self.jira_username}" '
+            f'AFTER "{self.start_date}" BEFORE "{self.end_date}") ORDER BY updated DESC'
         )
 
         issues = await self._search_issues(jql, max_results=200, expand="changelog")
@@ -347,14 +383,18 @@ class JiraContributionAnalyzer:
         verified_issues = []
         for issue in issues:
             issue_data = self._extract_issue_data(issue)
+            issue_data["_changelog"] = issue.get("changelog", {}).get("histories", [])
 
-            # Extract verified date from changelog if available
-            changelog = issue.get("changelog", {}).get("histories", [])
-            for entry in changelog:
+            # Determine which status to look for based on project
+            target_status = "Verified" if issue_data.get("project") == "OCPBUGS" else "Closed"
+            issue_data["verified_status"] = target_status
+
+            # Extract verified date from changelog
+            for entry in issue_data.get("_changelog", []):
                 author = entry.get("author", {})
-                author_email = author.get("emailAddress", "")
+                author_name = author.get("name", "")
 
-                if author_email != self.email:
+                if author_name != self.jira_username:
                     continue
 
                 created = entry.get("created", "")
@@ -362,14 +402,14 @@ class JiraContributionAnalyzer:
                     continue
 
                 for item in entry.get("items", []):
-                    if item.get("field") == "status" and item.get("toString") == "Verified":
+                    if item.get("field") == "status" and item.get("toString") == target_status:
                         issue_data["verified_date"] = created
                         break
 
             verified_issues.append(issue_data)
 
         self.tickets_verified = verified_issues
-        print(f"  Found {len(self.tickets_verified)} tickets verified", file=sys.stderr)
+        print(f"  Found {len(self.tickets_verified)} tickets verified/closed", file=sys.stderr)
 
     async def fetch_changelogs_and_comments(self) -> None:
         """Process changelogs (already fetched inline) and fetch comments only if needed."""
