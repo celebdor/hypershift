@@ -1501,6 +1501,149 @@ func TestReconcileHCPRouterServices(t *testing.T) {
 	}
 }
 
+// TestReconcileHCPRouterServicesDeletesOrphanedService verifies that orphaned router services
+// are cleaned up when UseHCPRouter() returns false. This handles upgrade scenarios where the
+// router was previously created but is no longer needed (e.g., when route hostnames are
+// subdomains of the management cluster's apps domain).
+func TestReconcileHCPRouterServicesDeletesOrphanedService(t *testing.T) {
+	const namespace = "test-ns"
+
+	t.Run("When cloud HCP uses apps domain hostname it should delete orphaned router service", func(t *testing.T) {
+		// Simulates AWS/GCP cloud environment where orphaned LoadBalancer incurs ongoing costs
+		existingCloudRouterService := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "router",
+				Namespace: namespace,
+				Annotations: map[string]string{
+					"service.beta.kubernetes.io/aws-load-balancer-type": "nlb",
+				},
+				Labels: map[string]string{"app": "private-router"},
+			},
+			Spec: corev1.ServiceSpec{
+				Type:     corev1.ServiceTypeLoadBalancer,
+				Selector: map[string]string{"app": "private-router"},
+				Ports: []corev1.ServicePort{
+					{Name: "https", Port: 443, TargetPort: intstr.FromString("https"), Protocol: corev1.ProtocolTCP},
+				},
+			},
+		}
+
+		hcp := &hyperv1.HostedControlPlane{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hcp",
+				Namespace: namespace,
+			},
+			Spec: hyperv1.HostedControlPlaneSpec{
+				Platform: hyperv1.PlatformSpec{
+					Type: hyperv1.AWSPlatform,
+					AWS: &hyperv1.AWSPlatformSpec{
+						EndpointAccess: hyperv1.Public,
+					},
+				},
+				Services: []hyperv1.ServicePublishingStrategyMapping{
+					{
+						Service: hyperv1.APIServer,
+						ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
+							Type: hyperv1.Route,
+							Route: &hyperv1.RoutePublishingStrategy{
+								Hostname: "apiserver.apps.example.com",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		ctx := ctrl.LoggerInto(t.Context(), zapr.NewLogger(zaptest.NewLogger(t)))
+		c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(existingCloudRouterService, hcp).Build()
+
+		r := HostedControlPlaneReconciler{
+			Client:               c,
+			Log:                  ctrl.LoggerFrom(ctx),
+			DefaultIngressDomain: "apps.example.com",
+		}
+
+		if err := r.reconcileHCPRouterServices(ctx, hcp, controllerutil.CreateOrUpdate); err != nil {
+			t.Fatalf("reconcileHCPRouterServices failed: %v", err)
+		}
+
+		var services corev1.ServiceList
+		if err := c.List(ctx, &services); err != nil {
+			t.Fatalf("failed to list services: %v", err)
+		}
+
+		if len(services.Items) != 0 {
+			t.Errorf("expected router service to be deleted, but it still exists")
+		}
+	})
+
+	t.Run("When bare metal with MetalLB uses apps domain hostname it should delete orphaned router service", func(t *testing.T) {
+		// Simulates bare metal environment where orphaned LoadBalancer consumes MetalLB IP from finite pool
+		existingMetalLBRouterService := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "router",
+				Namespace: namespace,
+				Annotations: map[string]string{
+					"metallb.universe.tf/address-pool": "lab-network",
+				},
+				Labels: map[string]string{"app": "private-router"},
+			},
+			Spec: corev1.ServiceSpec{
+				Type:     corev1.ServiceTypeLoadBalancer,
+				Selector: map[string]string{"app": "private-router"},
+				Ports: []corev1.ServicePort{
+					{Name: "https", Port: 443, TargetPort: intstr.FromString("https"), Protocol: corev1.ProtocolTCP},
+				},
+			},
+		}
+
+		hcp := &hyperv1.HostedControlPlane{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hcp",
+				Namespace: namespace,
+			},
+			Spec: hyperv1.HostedControlPlaneSpec{
+				Platform: hyperv1.PlatformSpec{
+					Type: hyperv1.NonePlatform,
+				},
+				Services: []hyperv1.ServicePublishingStrategyMapping{
+					{
+						Service: hyperv1.APIServer,
+						ServicePublishingStrategy: hyperv1.ServicePublishingStrategy{
+							Type: hyperv1.Route,
+							Route: &hyperv1.RoutePublishingStrategy{
+								Hostname: "apiserver.apps.example.com",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		ctx := ctrl.LoggerInto(t.Context(), zapr.NewLogger(zaptest.NewLogger(t)))
+		c := fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(existingMetalLBRouterService, hcp).Build()
+
+		r := HostedControlPlaneReconciler{
+			Client:               c,
+			Log:                  ctrl.LoggerFrom(ctx),
+			DefaultIngressDomain: "apps.example.com",
+		}
+
+		if err := r.reconcileHCPRouterServices(ctx, hcp, controllerutil.CreateOrUpdate); err != nil {
+			t.Fatalf("reconcileHCPRouterServices failed: %v", err)
+		}
+
+		var services corev1.ServiceList
+		if err := c.List(ctx, &services); err != nil {
+			t.Fatalf("failed to list services: %v", err)
+		}
+
+		if len(services.Items) != 0 {
+			t.Errorf("expected router service to be deleted, but it still exists")
+		}
+	})
+}
+
 func TestSetKASCustomKubeconfigStatus(t *testing.T) {
 	hcp := sampleHCP(t)
 	pullSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: hcp.Namespace, Name: "pull-secret"}}
