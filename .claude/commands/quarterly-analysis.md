@@ -1,8 +1,8 @@
 Generate a quarterly contribution analysis for a developer including commits and PR reviews.
 
 **Usage**:
-- `/quarterly-analysis <identifier> <quarter> [output-file]`
-- `/quarterly-analysis <identifier> <start-date> <end-date> [output-file]`
+- `/quarterly-analysis <identifier> <quarter> [--jira] [output-file]`
+- `/quarterly-analysis <identifier> <start-date> <end-date> [--jira] [output-file]`
 
 **Arguments**:
 - `identifier` (required): Developer's name, email, or GitHub username
@@ -13,6 +13,7 @@ Generate a quarterly contribution analysis for a developer including commits and
 - `quarter` (option 1): Quarter in Q[1-4]YYYY format (e.g., `Q32025`)
 - `start-date` (option 2): Start date in YYYY-MM-DD format (e.g., `2025-07-01`)
 - `end-date` (option 2): End date in YYYY-MM-DD format (e.g., `2025-09-30`)
+- `--jira` (optional): Include Jira contribution analysis (tickets reported, closed, verified, customer cases)
 - `output-file` (optional): Path to save the markdown report
 
 **Quarter Definitions**:
@@ -27,8 +28,15 @@ Generate a quarterly contribution analysis for a developer including commits and
 3. Identifies associated Jira tickets and PRs
 4. Analyzes PR review activity across all repositories
 5. Categorizes review types (approvals, technical feedback, questions, etc.)
-6. Generates a comprehensive markdown report with statistics and insights
-7. Optionally saves the report to the specified file path
+6. **(With --jira)** Analyzes Jira contributions:
+   - Tickets reported (with project breakdown)
+   - Tickets closed as Done
+   - Tickets verified (status transitions)
+   - Customer case linkage (SFDC cases)
+   - Backport ticket detection
+   - PR merge to ticket transition timing
+7. Generates a comprehensive markdown report with statistics and insights
+8. Optionally saves the report to the specified file path
 
 **Examples**:
 ```bash
@@ -52,6 +60,15 @@ Generate a quarterly contribution analysis for a developer including commits and
 
 # Analyze custom date range and save
 /quarterly-analysis developer@redhat.com 2025-04-01 2025-06-30 ~/qc/2025/2nd/developer.md
+
+# Include Jira contribution analysis
+/quarterly-analysis jparrill@redhat.com Q32025 --jira
+
+# Full analysis with Jira and save to file
+/quarterly-analysis jparrill@redhat.com Q32025 --jira ~/qc/2025/3rd/jparrill.md
+
+# Date range with Jira analysis
+/quarterly-analysis developer@redhat.com 2025-07-01 2025-09-30 --jira ~/qc/2025/3rd/report.md
 ```
 
 **Implementation**:
@@ -112,7 +129,38 @@ This outputs:
 - Review states and comments for each PR
 - Sample of inline code review comments
 
-Step 3: Classify commits by topic
+Step 3a: (If --jira flag is present) Analyze Jira contributions
+
+Check if `--jira` appears in any of the arguments. If present:
+
+If quarter format:
+```bash
+./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> <START_DATE> <END_DATE> -o /tmp/jira_contributions.json
+```
+
+If date range format:
+```bash
+./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> {{args.1}} {{args.2}} -o /tmp/jira_contributions.json
+```
+
+Where START_DATE and END_DATE are derived from the quarter (Q1=Jan 1 to Mar 31, etc.)
+
+This script outputs JSON with:
+- `summary`: Overview statistics (tickets reported, closed, verified, backports, SFDC-linked)
+- `project_breakdown`: Count of tickets per Jira project (OCPBUGS, CNTRLPLANE, etc.)
+- `tickets_reported`: Full details of tickets the developer reported
+- `tickets_closed`: Tickets closed as Done where developer was assignee
+- `tickets_verified`: Tickets where developer performed verification
+- `backport_tickets`: Tickets identified as backports (clone + depends pattern)
+- `sfdc_linked_tickets`: Tickets with customer case linkage (SFDC Cases Counter > 0)
+- `activity_by_ticket`: Comments and status updates per ticket
+- `pr_to_transition_timing`: Time between PR merge and ticket status transitions
+
+**Environment Requirements for Jira**:
+- `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable must be set
+- Token can be generated at https://issues.redhat.com (Profile → Personal Access Tokens)
+
+Step 4: Classify commits by topic
 
 Common topics in HyperShift:
 - **ARO** (Azure Red Hat OpenShift)
@@ -255,6 +303,76 @@ Step 6: Generate the comprehensive report
 **OCPBUGS (Bug Fixes):**
 - [OCPBUGS-XXX](https://issues.redhat.com/browse/OCPBUGS-XXX): [Description]
 - [OCPBUGS-YYY](https://issues.redhat.com/browse/OCPBUGS-YYY): [Description]
+
+---
+
+## Jira Contribution Activity
+
+**(Only include this section if --jira flag was used)**
+
+### Summary Statistics
+- **Tickets Reported:** XX tickets
+- **Tickets Closed (Done):** XX tickets
+- **Tickets Verified:** XX tickets
+- **Backport Tickets:** XX tickets
+- **Customer-Linked Tickets (SFDC):** XX tickets
+- **Total Comments Made:** XX comments
+- **Total Status Updates:** XX updates
+
+### Tickets by Project
+
+| Project | Reported | Closed | Verified |
+|---------|----------|--------|----------|
+| OCPBUGS | XX | XX | XX |
+| CNTRLPLANE | XX | XX | XX |
+| HOSTEDCP | XX | XX | XX |
+| RFE | XX | XX | XX |
+
+### Customer Impact (SFDC-Linked Tickets)
+
+Tickets with linked customer cases demonstrate direct customer impact:
+
+1. **[OCPBUGS-XXX](https://issues.redhat.com/browse/OCPBUGS-XXX)**: [Summary]
+   - **SFDC Cases:** X linked cases
+   - **Status:** [Current status]
+   - **Impact:** [Description of customer impact]
+
+2. **[OCPBUGS-YYY](https://issues.redhat.com/browse/OCPBUGS-YYY)**: [Summary]
+   - **SFDC Cases:** X linked cases
+   - **Status:** [Current status]
+
+### Backport Activity
+
+Backport tickets (cloned from upstream with dependency link):
+
+1. **[OCPBUGS-XXX](https://issues.redhat.com/browse/OCPBUGS-XXX)** → Backport of [OCPBUGS-YYY](https://issues.redhat.com/browse/OCPBUGS-YYY)
+   - **Target Version:** 4.XX
+   - **Status:** [Status]
+
+### Tickets Reported
+
+Key tickets reported by the developer during this period:
+
+1. **[TICKET-XXX](https://issues.redhat.com/browse/TICKET-XXX)**: [Summary]
+   - **Type:** [Bug/Story/Task]
+   - **Priority:** [Priority]
+   - **Current Status:** [Status]
+
+### Tickets Verified
+
+Tickets where the developer performed QE verification:
+
+1. **[TICKET-XXX](https://issues.redhat.com/browse/TICKET-XXX)**: [Summary]
+   - **Verified Date:** [Date]
+   - **Resolution:** Done
+
+### PR Merge to Ticket Transition Timing
+
+Average time from PR merge to ticket status update: **XX hours**
+
+Notable transitions:
+- [TICKET-XXX](https://issues.redhat.com/browse/TICKET-XXX): PR merged → Status updated in X hours
+- [TICKET-YYY](https://issues.redhat.com/browse/TICKET-YYY): PR merged → Status updated in X hours
 
 ---
 
@@ -553,3 +671,12 @@ If validation errors are reported, fix them in the generated report before compl
 - Large date ranges may take several minutes to process due to GitHub API calls
 - The report identifies both technical and non-technical contributions
 - Cross-repo searches are limited to 500 PRs for authored PRs and 200 for reviews (GitHub API limits)
+
+**Jira Analysis Notes** (when using --jira):
+- Requires `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable
+- Jira token can be generated at https://issues.redhat.com (Profile → Personal Access Tokens)
+- Analyzes tickets in projects: OCPBUGS, CNTRLPLANE, HOSTEDCP, RFE, OCPSTRAT
+- Backport detection: Identifies tickets that are clones with a "depends on" link to the original
+- SFDC linkage: Uses custom fields `SFDC Cases Counter` and `SFDC Cases Links`
+- Uses conservative rate limiting (~15 req/s) to avoid hitting Jira API limits
+- The Jira script may take 2-5 minutes depending on the number of tickets
