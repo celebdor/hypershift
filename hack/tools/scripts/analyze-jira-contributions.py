@@ -290,8 +290,33 @@ class JiraContributionAnalyzer:
         except Exception:
             return False
 
+    async def _lookup_jira_user(self) -> None:
+        """Look up Jira username directly via user search API.
+
+        The Jira user search API matches against username, display name, AND email.
+        This is more reliable than discovering from issue responses, especially when
+        users have no tickets in the date range.
+        """
+        if self.jira_username:
+            return  # Already known
+
+        print(f"Looking up Jira user for {self.email}...", file=sys.stderr)
+
+        # Search by email - the API matches against email addresses
+        url = f"{JIRA_URL}/rest/api/2/user/search?username={self.email}&maxResults=10"
+        data = await self._fetch_json(url)
+
+        if data and isinstance(data, list):
+            for user in data:
+                if user.get("emailAddress") == self.email:
+                    self.jira_username = user.get("name")
+                    print(f"  Found Jira username: {self.jira_username}", file=sys.stderr)
+                    return
+
+        print("  Could not find Jira user via API, will try discovery from issues", file=sys.stderr)
+
     def _discover_jira_username(self, issues: List[Dict]) -> None:
-        """Discover the Jira username from API responses."""
+        """Discover the Jira username from API responses (fallback method)."""
         if self.jira_username:
             return  # Already discovered
 
@@ -625,9 +650,16 @@ class JiraContributionAnalyzer:
 
     async def _run_analysis(self) -> Dict:
         """Internal analysis runner."""
-        # Fetch all data
-        await self.fetch_tickets_reported()
-        await self.fetch_tickets_closed()
+        # First, try to look up the Jira username directly via API
+        await self._lookup_jira_user()
+
+        # Fetch reported and closed tickets in parallel (they're independent)
+        await asyncio.gather(
+            self.fetch_tickets_reported(),
+            self.fetch_tickets_closed(),
+        )
+
+        # Verified query depends on username being known (from lookup or discovery)
         await self.fetch_tickets_verified()
         await self.fetch_changelogs_and_comments()
 
