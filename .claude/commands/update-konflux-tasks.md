@@ -46,10 +46,9 @@ Automatically update outdated Konflux Tekton tasks based on enterprise contract 
    - For any tasks with version bumps (not just digest updates), check for migration notes
    - If a task matches quay.io/redhat-appstudio-tekton-catalog/ rather than quay.io/konflux-ci/tekton-catalog, we should check if it is available in quay.io/konflux-ci/tekton-catalog and change to use the latter.
    - Use URL pattern: `https://github.com/konflux-ci/build-definitions/blob/main/task/{task-name}/{version}/MIGRATION.md`
-   - If the migration notes reference a migration script, check their availability with the pattern: `https://github.com/konflux-ci/build-definitions/blob/main/task/{task-name}/{version}/migrations/{version}.sh`. If it is available:
-     - Run the migration script on the identified pipeline files
-   - Extract any breaking changes, new parameters, or manual steps required
-   - Ask the user for input in any manual steps are required
+   - Migration scripts are automatically detected and run by `update_trusted_task_bundles.py` when version bumps occur (requires `pmt`: `pip install git+https://github.com/konflux-ci/pipeline-migration-tool`)
+   - Extract any breaking changes, new parameters, or manual steps required from MIGRATION.md
+   - Ask the user for input if any manual steps are required
    - Report if "No action required" or list specific migration steps
 
 4. **Update Pipeline Files**:
@@ -112,6 +111,7 @@ Automatically update outdated Konflux Tekton tasks based on enterprise contract 
 - `skopeo` must be installed (for container image inspection)
 - `jq` must be installed (for JSON parsing)
 - `yq` must be installed (for YAML parsing and checking multi-platform builds)
+- `pmt` (pipeline-migration-tool) must be installed for running migration scripts on version bumps: `pip install git+https://github.com/konflux-ci/pipeline-migration-tool`
 - `pyyaml` Python package must be installed when running without a log file (for update_trusted_task_bundles.py)
 - Internet connectivity (to check migration notes and inspect container images)
 

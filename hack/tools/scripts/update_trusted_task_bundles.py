@@ -18,6 +18,9 @@ Examples:
     # Show diff of changes (without applying)
     ./update_trusted_task_bundles.py .tekton/pipelines/*.yaml --dry-run --diff
 
+    # Upgrade to latest versions (migration scripts run automatically)
+    ./update_trusted_task_bundles.py .tekton/**/*.yaml --upgrade-versions
+
     # Use a different data source
     ./update_trusted_task_bundles.py pipeline.yaml --data-source quay.io/other/data:latest
 
@@ -489,6 +492,163 @@ def print_summary(
         print()
 
 
+MIGRATION_SCRIPT_URL = (
+    "https://raw.githubusercontent.com/konflux-ci/build-definitions/main"
+    "/task/{task_name}/{version}/migrations/{version}.sh"
+)
+
+
+def get_intermediate_versions(current: str, target: str) -> List[str]:
+    """Get all intermediate versions between current (exclusive) and target (inclusive).
+
+    For example, get_intermediate_versions("0.2", "0.4") returns ["0.3", "0.4"].
+    """
+    try:
+        current_parts = [int(p) for p in current.split('.')]
+        target_parts = [int(p) for p in target.split('.')]
+    except ValueError:
+        return [target]
+
+    # Simple case: single-level versions like 0.2, 0.3, 0.4
+    if len(current_parts) == 2 and len(target_parts) == 2 and current_parts[0] == target_parts[0]:
+        return [f"{current_parts[0]}.{minor}" for minor in range(current_parts[1] + 1, target_parts[1] + 1)]
+
+    return [target]
+
+
+def find_migration_scripts(task_name: str, current_version: str, target_version: str) -> List[Tuple[str, str]]:
+    """Find available migration scripts for intermediate versions.
+
+    Args:
+        task_name: e.g. "task-init" -> stripped to "init" for the URL
+        current_version: e.g. "0.2"
+        target_version: e.g. "0.4"
+
+    Returns:
+        List of (version, script_url) for versions that have migration scripts.
+    """
+    # Strip "task-" prefix for the build-definitions repo path
+    short_name = task_name.removeprefix("task-")
+
+    versions = get_intermediate_versions(current_version, target_version)
+    available = []
+
+    for version in versions:
+        url = MIGRATION_SCRIPT_URL.format(task_name=short_name, version=version)
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-o", "/dev/null", "-w", "%{http_code}", url],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.stdout.strip() == "200":
+                available.append((version, url))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
+
+    return available
+
+
+def run_migrations(all_results: Dict[Path, 'AnalysisResult'], quiet: bool = False):
+    """Run migration scripts for all version bumps across pipeline files."""
+    # Check pmt is available
+    try:
+        subprocess.run(["pmt", "--help"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print(
+            "Error: pmt (pipeline-migration-tool) is required for migrations.\n"
+            "Install with: pip install git+https://github.com/konflux-ci/pipeline-migration-tool",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    # Collect unique version bumps (task_name -> (current, target))
+    version_bumps: Dict[str, Tuple[str, str]] = {}
+    bump_files: Dict[str, List[Path]] = {}
+
+    for filepath, result in all_results.items():
+        for update in result.updates:
+            if update.is_version_bump:
+                key = update.task_name
+                version_bumps[key] = (update.current_version, update.latest_version)
+                bump_files.setdefault(key, []).append(filepath)
+
+    if not version_bumps:
+        if not quiet:
+            print("\nNo version bumps found, no migrations needed.")
+        return
+
+    if not quiet:
+        print(f"\n🔄 Checking migration scripts for {len(version_bumps)} version bump(s)...")
+
+    for task_name, (current, target) in version_bumps.items():
+        scripts = find_migration_scripts(task_name, current, target)
+        if not scripts:
+            if not quiet:
+                print(f"  {task_name}: {current} → {target} — no migration scripts found")
+            continue
+
+        for version, url in scripts:
+            if not quiet:
+                print(f"  {task_name}: running {version} migration...")
+
+            # Download the script
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                script_path = f.name
+
+            try:
+                subprocess.run(
+                    ["curl", "-fsSL", "-o", script_path, url],
+                    check=True, capture_output=True
+                )
+                os.chmod(script_path, 0o755)
+
+                # Run on each affected file
+                for filepath in bump_files[task_name]:
+                    if not quiet:
+                        print(f"    → {filepath}")
+                    subprocess.run(
+                        ["bash", script_path, str(filepath)],
+                        check=True
+                    )
+            except subprocess.CalledProcessError as e:
+                print(f"  ⚠️  Migration script failed for {task_name} {version}: {e}", file=sys.stderr)
+            finally:
+                os.unlink(script_path)
+
+    if not quiet:
+        print("✅ Migrations complete.\n")
+
+
+def print_pending_migrations(all_results: Dict[Path, 'AnalysisResult']):
+    """Print migration scripts that would be run (dry-run mode)."""
+    version_bumps: Dict[str, Tuple[str, str]] = {}
+    bump_files: Dict[str, List[Path]] = {}
+
+    for filepath, result in all_results.items():
+        for update in result.updates:
+            if update.is_version_bump:
+                key = update.task_name
+                version_bumps[key] = (update.current_version, update.latest_version)
+                bump_files.setdefault(key, []).append(filepath)
+
+    if not version_bumps:
+        return
+
+    print(f"\n🔄 Migration scripts to run for {len(version_bumps)} version bump(s):")
+
+    for task_name, (current, target) in version_bumps.items():
+        scripts = find_migration_scripts(task_name, current, target)
+        if not scripts:
+            print(f"  {task_name}: {current} → {target} — no migration scripts found")
+        else:
+            for version, url in scripts:
+                files = ", ".join(str(f) for f in bump_files[task_name])
+                print(f"  {task_name}: {version} migration → {files}")
+                print(f"    {url}")
+
+    print("\nℹ️  Run without --dry-run to apply these migrations.\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Update Tekton pipeline task bundles to latest trusted versions',
@@ -530,6 +690,11 @@ def main():
         '--quiet', '-q',
         action='store_true',
         help='Only show errors'
+    )
+    parser.add_argument(
+        '--skip-migrations',
+        action='store_true',
+        help='Skip running migration scripts for version bumps (not recommended)'
     )
 
     args = parser.parse_args()
@@ -621,6 +786,16 @@ def main():
                 f.write(updated)
             if not args.quiet:
                 print(f"✅ Updated {filepath}")
+
+    # Run migrations for version bumps (always, unless explicitly skipped)
+    has_version_bumps = any(
+        u.is_version_bump for r in all_results.values() for u in r.updates
+    )
+    if has_version_bumps and not args.skip_migrations:
+        if args.dry_run:
+            print_pending_migrations(all_results)
+        else:
+            run_migrations(all_results, quiet=args.quiet)
 
     # Exit with status based on whether updates were found
     total_updates = sum(len(r.updates) for r in all_results.values())
