@@ -42,21 +42,15 @@ Automatically update outdated Konflux Tekton tasks based on enterprise contract 
    - It filters out commit-hash style tags (e.g., "0.2-f788d9b...") and only returns clean semantic versions
    - Create a mapping of: task-name → current-version@digest → latest-version@digest
 
-3. **Check for Migration Notes**:
-   - For any tasks with version bumps (not just digest updates), check for migration notes
-   - If a task matches quay.io/redhat-appstudio-tekton-catalog/ rather than quay.io/konflux-ci/tekton-catalog, we should check if it is available in quay.io/konflux-ci/tekton-catalog and change to use the latter.
-   - Use URL pattern: `https://github.com/konflux-ci/build-definitions/blob/main/task/{task-name}/{version}/MIGRATION.md`
-   - Migration scripts are automatically detected and run by `update_trusted_task_bundles.py` when version bumps occur (requires `pmt`: `pip install git+https://github.com/konflux-ci/pipeline-migration-tool`)
-   - Extract any breaking changes, new parameters, or manual steps required from MIGRATION.md
-   - Ask the user for input if any manual steps are required
-   - Report if "No action required" or list specific migration steps
+3. **Apply Updates and Handle Migrations**:
+   a. Run `hack/tools/scripts/update_trusted_task_bundles.py .tekton/*.yaml --upgrade-versions` (without `--dry-run`) to apply all updates — both digest-only updates and version bumps — to bundle references across all pipeline files. Migration scripts for version bumps are automatically detected and run by the script (requires `pmt`: `pip install git+https://github.com/konflux-ci/pipeline-migration-tool`).
+   b. For any tasks with version bumps (identified in step 1), check for manual migration steps:
+      - If a task matches quay.io/redhat-appstudio-tekton-catalog/ rather than quay.io/konflux-ci/tekton-catalog, check if it is available in quay.io/konflux-ci/tekton-catalog and change to use the latter.
+      - Use URL pattern: `https://github.com/konflux-ci/build-definitions/blob/main/task/{task-name}/{version}/MIGRATION.md`
+      - **Manual instructions in MIGRATION.md**: Extract breaking changes, new parameters, or manual steps. Interpret and apply these instructions to the affected pipeline files (e.g., adding new parameters, renaming fields, updating configurations). Ask the user for confirmation if the instructions are ambiguous.
+      - **No migration documentation (404)**: Warn the user that no migration docs exist for this version bump and ask whether the upgrade should be kept or reverted.
 
-4. **Update Pipeline Files**:
-   - Discover all Tekton pipeline YAML files using the glob `.tekton/**/*.yaml`
-   - Replace old `quay.io/konflux-ci/tekton-catalog/task-{name}:{old-version}@{old-digest}` with new versions
-   - Use MultiEdit for efficiency when updating multiple tasks per file
-
-5. **Provide Comprehensive Summary**:
+4. **Provide Comprehensive Summary**:
    - List all outdated tasks found and their update status
    - Show current vs. latest version mappings
    - Highlight any version bumps vs. digest-only updates
