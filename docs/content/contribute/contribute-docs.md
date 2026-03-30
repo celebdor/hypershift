@@ -9,7 +9,7 @@ HyperShift's documentation is based on [MkDocs](https://www.mkdocs.org) with the
 [Diátaxis Framework](https://diataxis.fr) for content organization and stylistic
 approach.
 
-The documentation site is built and published automatically to [https://hypershift.pages.dev/](https://hypershift.pages.dev/).
+The documentation site is built and published automatically to [https://hypershift.pages.dev/](https://hypershift.pages.dev/). PRs that modify files under `docs/` get an automatic preview deployment — see [Documentation Preview](../how-to/ci/docs-preview.md) for details.
 
 ## Overview
 
