@@ -1,0 +1,113 @@
+# UBI 10-based GitHub Actions Runner for HyperShift CI
+#
+# This is a self-contained build that replaces the upstream Ubuntu-based
+# ghcr.io/actions/actions-runner image with a UBI 10 base.
+#
+# The GitHub Actions Runner is a self-contained .NET application distributed
+# as a tarball. It needs native libraries (ICU, OpenSSL, libstdc++) that on
+# Ubuntu come from the dotnet/runtime-deps base image. On UBI 10, we install
+# the equivalent RPMs directly.
+
+# Stage 1: Download runner binaries
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest AS build
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG RUNNER_VERSION=2.333.0
+ARG RUNNER_CONTAINER_HOOKS_VERSION=0.7.0
+ARG DOCKER_VERSION=29.3.0
+
+RUN microdnf install -y curl unzip tar gzip && microdnf clean all
+
+WORKDIR /actions-runner
+
+# Download the GitHub Actions Runner
+RUN export RUNNER_ARCH=${TARGETARCH} \
+    && if [ "$RUNNER_ARCH" = "amd64" ]; then export RUNNER_ARCH=x64 ; fi \
+    && curl -f -L -o runner.tar.gz https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-${TARGETOS}-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz \
+    && tar xzf ./runner.tar.gz \
+    && rm runner.tar.gz
+
+# Download runner container hooks for Kubernetes mode
+RUN curl -f -L -o runner-container-hooks.zip https://github.com/actions/runner-container-hooks/releases/download/v${RUNNER_CONTAINER_HOOKS_VERSION}/actions-runner-hooks-k8s-${RUNNER_CONTAINER_HOOKS_VERSION}.zip \
+    && unzip ./runner-container-hooks.zip -d ./k8s \
+    && rm runner-container-hooks.zip
+
+# Download Docker CLI (needed by the runner for some actions, not for DinD)
+RUN export DOCKER_ARCH=${TARGETARCH} \
+    && if [ "$DOCKER_ARCH" = "amd64" ]; then export DOCKER_ARCH=x86_64 ; fi \
+    && if [ "$DOCKER_ARCH" = "arm64" ]; then export DOCKER_ARCH=aarch64 ; fi \
+    && curl -fLo docker.tgz https://download.docker.com/${TARGETOS}/static/stable/${DOCKER_ARCH}/docker-${DOCKER_VERSION}.tgz \
+    && tar zxvf docker.tgz \
+    && rm -rf docker.tgz
+
+# Stage 2: Final image
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
+
+ENV RUNNER_MANUALLY_TRAP_SIG=1
+ENV ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1
+ENV ImageOS=ubi10
+
+# .NET runtime native dependencies (equivalent to dotnet/runtime-deps on Ubuntu)
+# plus tools needed by the runner and GitHub Actions
+RUN microdnf install -y \
+        # .NET native deps
+        libicu \
+        openssl-libs \
+        libstdc++ \
+        zlib \
+        tzdata \
+        # Runner and CI tools
+        sudo \
+        curl \
+        jq \
+        unzip \
+        git \
+        tar \
+        gzip \
+        # HyperShift build deps
+        make \
+        gcc \
+        glibc-devel \
+        ca-certificates \
+        python3-pip \
+    && microdnf clean all
+
+# Create runner user (UID 1001 to match upstream)
+RUN useradd --no-log-init --uid 1001 --create-home runner \
+    && echo "runner ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers.d/runner \
+    && chmod 0440 /etc/sudoers.d/runner \
+    && chmod 777 /home/runner
+
+WORKDIR /home/runner
+
+# Copy runner binaries from build stage
+COPY --chown=runner:0 --from=build /actions-runner .
+
+# Install Docker CLI
+RUN install -o root -g root -m 755 docker/* /usr/bin/ && rm -rf docker
+
+# Install Go
+ARG TARGETARCH
+ARG GO_VERSION=1.25.3
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -C /usr/local -xz
+
+# Install oc/kubectl
+RUN OCP_ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
+    curl -fsSL "https://mirror.openshift.com/pub/openshift-v4/${OCP_ARCH}/clients/ocp/stable/openshift-client-linux.tar.gz" | tar -C /usr/local/bin -xz oc kubectl
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/home/runner/go"
+ENV PATH="${GOPATH}/bin:${PATH}"
+
+# Pre-build lint tools (golangci-lint and kube-api-linter plugin)
+COPY hack/tools/ /tmp/tools/
+RUN cd /tmp/tools && \
+    mkdir -p /opt/lint-tools && \
+    GO111MODULE=on GOWORK=off GOFLAGS=-mod=vendor go build -tags=tools \
+        -o /opt/lint-tools/golangci-lint github.com/golangci/golangci-lint/v2/cmd/golangci-lint && \
+    CGO_ENABLED=1 GO111MODULE=on GOWORK=off GOFLAGS=-mod=vendor go build -buildmode=plugin \
+        -o /opt/lint-tools/kube-api-linter.so sigs.k8s.io/kube-api-linter/pkg/plugin && \
+    rm -rf /tmp/tools
+
+USER runner
