@@ -8,8 +8,13 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  authorize:
+    uses: ./.github/workflows/authorize-pr.yaml
+
   test:
     name: Unit Tests
+    needs: [authorize]
+    if: needs.authorize.outputs.authorized == 'true'
     runs-on: arc-runner-set
     timeout-minutes: 30
     steps:

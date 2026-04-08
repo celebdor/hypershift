@@ -5,8 +5,13 @@ on:
     branches: [main]
 
 jobs:
+  authorize:
+    uses: ./.github/workflows/authorize-pr.yaml
+
   verify:
     name: Verify
+    needs: [authorize]
+    if: needs.authorize.outputs.authorized == 'true'
     runs-on: arc-runner-set
     timeout-minutes: 60
     steps:

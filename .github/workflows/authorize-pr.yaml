@@ -1,0 +1,44 @@
+name: Authorize PR
+
+on:
+  workflow_call:
+    outputs:
+      authorized:
+        description: Whether the PR is authorized to run CI
+        value: ${{ jobs.authorize.outputs.authorized }}
+
+jobs:
+  authorize:
+    name: Authorize
+    runs-on: arc-runner-set
+    timeout-minutes: 1
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: Check PR authorization
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Non-PR events (push, workflow_dispatch) are always authorized
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('authorized', 'true');
+              return;
+            }
+
+            const pr = context.payload.pull_request;
+            const trusted = ['MEMBER', 'COLLABORATOR', 'OWNER'];
+            if (trusted.includes(pr.author_association)) {
+              console.log(`Author is ${pr.author_association}, authorized`);
+              core.setOutput('authorized', 'true');
+              return;
+            }
+
+            if (pr.labels.some(l => l.name === 'ok-to-test')) {
+              console.log('ok-to-test label present, authorized');
+              core.setOutput('authorized', 'true');
+              return;
+            }
+
+            core.setOutput('authorized', 'false');
+            core.warning('PR author is not an org member and ok-to-test label is missing. A maintainer must add the ok-to-test label to run CI.');

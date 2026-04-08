@@ -16,8 +16,13 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  authorize:
+    uses: ./.github/workflows/authorize-pr.yaml
+
   envtest-ocp:
     name: Envtest OCP (K8s ${{ matrix.version }})
+    needs: [authorize]
+    if: needs.authorize.outputs.authorized == 'true'
     runs-on: arc-runner-set
     timeout-minutes: 15
     strategy:
