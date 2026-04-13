@@ -2,7 +2,9 @@ name: Sync Community Fork
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'release-*'
 
 jobs:
   sync-community-fork:
@@ -20,4 +22,4 @@ jobs:
           token: ${{ secrets.COMMUNITY_FORK_TOKEN }}
       - run: |
           git remote add community https://github.com/hypershift-community/hypershift.git
-          git push community main
+          git push community ${{ github.ref_name }}
