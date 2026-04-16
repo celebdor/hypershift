@@ -37,20 +37,21 @@ except ImportError:
     HAS_AIOHTTP = False
     print("Warning: aiohttp not available, using synchronous requests", file=sys.stderr)
 
-# Jira configuration
-JIRA_URL = os.getenv("JIRA_URL", "https://issues.redhat.com")
+# Jira configuration (Atlassian Cloud)
+JIRA_URL = os.getenv("JIRA_URL", "https://redhat.atlassian.net")
 JIRA_TOKEN = os.getenv("JIRA_API_TOKEN") or os.getenv("JIRA_TOKEN")
+JIRA_USERNAME = os.getenv("JIRA_USERNAME") or os.getenv("JIRA_EMAIL")
 
-# Custom field IDs (discovered via Jira API)
-FIELD_SFDC_CASES_COUNTER = "customfield_12313440"
-FIELD_SFDC_CASES_LINKS = "customfield_12313441"
-FIELD_SFDC_CASES_OPEN = "customfield_12324540"
+# Custom field IDs for Jira Cloud
+FIELD_SFDC_CASES_COUNTER = "customfield_10978"
+FIELD_SFDC_CASES_LINKS = "customfield_10979"
+FIELD_SFDC_CASES_OPEN = "customfield_10980"
 FIELD_TARGET_VERSION = "customfield_12319940"
 FIELD_TARGET_BACKPORT_VERSIONS = "customfield_12323940"
 
-# Link type IDs
-LINK_TYPE_CLONERS = "12310120"  # "clones" / "is cloned by"
-LINK_TYPE_DEPEND = "12311220"   # "depends on" / "is depended on by"
+# Link type names (Cloud uses names, not numeric IDs)
+LINK_TYPE_CLONERS_NAME = "Cloners"
+LINK_TYPE_DEPEND_NAME = "Depend"
 
 # Projects we care about
 JIRA_PROJECTS = ["OCPBUGS", "CNTRLPLANE", "HOSTEDCP", "RFE", "OCPSTRAT"]
@@ -88,12 +89,16 @@ class JiraContributionAnalyzer:
         self.request_lock = asyncio.Lock()
 
     def _get_headers(self) -> Dict[str, str]:
-        """Get HTTP headers for Jira API requests."""
+        """Get HTTP headers for Jira API requests (Atlassian Cloud Basic Auth)."""
+        import base64
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        if JIRA_TOKEN:
+        if JIRA_TOKEN and JIRA_USERNAME:
+            credentials = base64.b64encode(f"{JIRA_USERNAME}:{JIRA_TOKEN}".encode()).decode()
+            headers["Authorization"] = f"Basic {credentials}"
+        elif JIRA_TOKEN:
             headers["Authorization"] = f"Bearer {JIRA_TOKEN}"
         return headers
 
@@ -150,33 +155,96 @@ class JiraContributionAnalyzer:
                     print(f"Error fetching {url}: {e}", file=sys.stderr)
                     return None
 
+    async def _post_json(self, url: str, payload: Dict) -> Optional[Dict]:
+        """POST JSON to URL with rate limiting (for Jira Cloud search)."""
+        async with self.semaphore:
+            await asyncio.sleep(REQUEST_DELAY_SECONDS)
+            await self._rate_limit()
+
+            if HAS_AIOHTTP and self.session:
+                try:
+                    async with self.session.post(url, headers=self._get_headers(), json=payload) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        elif response.status == 401:
+                            print(f"Error: Authentication failed. Check JIRA_USERNAME and JIRA_API_TOKEN.", file=sys.stderr)
+                            return None
+                        elif response.status == 410:
+                            print(f"Error: API endpoint gone (410). Jira Cloud requires /rest/api/3/.", file=sys.stderr)
+                            return None
+                        elif response.status == 429:
+                            print(f"  Rate limited! Waiting 30 seconds...", file=sys.stderr)
+                            await asyncio.sleep(30)
+                            return await self._post_json(url, payload)
+                        else:
+                            body = await response.text()
+                            print(f"Warning: HTTP {response.status} for POST {url}: {body[:200]}", file=sys.stderr)
+                            return None
+                except Exception as e:
+                    print(f"Error posting {url}: {e}", file=sys.stderr)
+                    return None
+            else:
+                try:
+                    response = requests.post(url, headers=self._get_headers(), json=payload)
+                    if response.status_code == 200:
+                        return response.json()
+                    elif response.status_code == 429:
+                        print(f"  Rate limited! Waiting 30 seconds...", file=sys.stderr)
+                        import time
+                        time.sleep(30)
+                        return None
+                    else:
+                        print(f"Warning: HTTP {response.status_code} for POST {url}: {response.text[:200]}", file=sys.stderr)
+                        return None
+                except Exception as e:
+                    print(f"Error posting {url}: {e}", file=sys.stderr)
+                    return None
+
+    # Default fields to request from Jira Cloud v3 API.
+    # Cloud v3 POST /rest/api/3/search/jql returns only issue IDs when
+    # no fields are specified — explicit list is required.
+    DEFAULT_FIELDS = [
+        "summary", "status", "resolution", "priority", "issuetype",
+        "project", "created", "updated", "resolutiondate",
+        "reporter", "assignee", "labels", "components", "issuelinks",
+        "comment",
+        FIELD_SFDC_CASES_COUNTER, FIELD_SFDC_CASES_LINKS, FIELD_SFDC_CASES_OPEN,
+        FIELD_TARGET_VERSION, FIELD_TARGET_BACKPORT_VERSIONS,
+    ]
+
     async def _search_issues(self, jql: str, fields: str = "*all", max_results: int = 100, expand: Optional[str] = None) -> List[Dict]:
-        """Search Jira issues using JQL."""
+        """Search Jira issues using JQL (Jira Cloud v3 POST endpoint)."""
         all_issues = []
-        start_at = 0
+        next_page_token = None
 
         while True:
-            params = {
+            payload = {
                 "jql": jql,
-                "fields": fields,
                 "maxResults": min(max_results - len(all_issues), 50),
-                "startAt": start_at,
             }
-            if expand:
-                params["expand"] = expand
-            url = f"{JIRA_URL}/rest/api/2/search?{urlencode(params)}"
+            # Cloud v3 requires explicit field list — omitting fields
+            # returns only issue IDs. Use DEFAULT_FIELDS for "*all".
+            if fields == "*all":
+                payload["fields"] = self.DEFAULT_FIELDS
+            else:
+                payload["fields"] = [f.strip() for f in fields.split(",")]
+            # Note: Cloud v3 POST /search/jql does NOT support "expand".
+            # Changelogs must be fetched separately via
+            # GET /rest/api/3/issue/{key}/changelog.
+            if next_page_token:
+                payload["nextPageToken"] = next_page_token
 
-            data = await self._fetch_json(url)
+            url = f"{JIRA_URL}/rest/api/3/search/jql"
+            data = await self._post_json(url, payload)
             if not data:
                 break
 
             issues = data.get("issues", [])
             all_issues.extend(issues)
 
-            if len(all_issues) >= data.get("total", 0) or len(issues) == 0:
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token or len(issues) == 0:
                 break
-
-            start_at += len(issues)
 
             if len(all_issues) >= max_results:
                 break
@@ -189,7 +257,7 @@ class JiraContributionAnalyzer:
         start_at = 0
 
         while True:
-            url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}/changelog?startAt={start_at}&maxResults=100"
+            url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}/changelog?startAt={start_at}&maxResults=100"
             data = await self._fetch_json(url)
 
             if not data:
@@ -207,7 +275,7 @@ class JiraContributionAnalyzer:
 
     async def _get_issue_comments(self, issue_key: str) -> List[Dict]:
         """Get comments for a specific issue."""
-        url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}/comment?maxResults=100"
+        url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}/comment?maxResults=100"
         data = await self._fetch_json(url)
         return data.get("comments", []) if data else []
 
@@ -234,17 +302,17 @@ class JiraContributionAnalyzer:
 
         for link in issue_links:
             link_type = link.get("type", {})
-            link_type_id = link_type.get("id", "")
+            link_type_name = link_type.get("name", "")
 
-            # Check for clone relationship
-            if link_type_id == LINK_TYPE_CLONERS:
+            # Check for clone relationship (match by name for Cloud)
+            if link_type_name == LINK_TYPE_CLONERS_NAME:
                 if "outwardIssue" in link:  # This issue clones another
                     clones_link = link["outwardIssue"].get("key")
                 elif "inwardIssue" in link:  # This issue is cloned by another
                     pass  # We care about "clones", not "is cloned by"
 
             # Check for depends relationship
-            if link_type_id == LINK_TYPE_DEPEND:
+            if link_type_name == LINK_TYPE_DEPEND_NAME:
                 if "outwardIssue" in link:  # This issue depends on another
                     depends_on_link = link["outwardIssue"].get("key")
 
@@ -302,21 +370,24 @@ class JiraContributionAnalyzer:
 
         print(f"Looking up Jira user for {self.email}...", file=sys.stderr)
 
-        # Search by email - the API matches against email addresses
-        url = f"{JIRA_URL}/rest/api/2/user/search?username={self.email}&maxResults=10"
+        # Jira Cloud uses ?query= parameter for user search
+        url = f"{JIRA_URL}/rest/api/3/user/search?query={self.email}&maxResults=10"
         data = await self._fetch_json(url)
 
         if data and isinstance(data, list):
             for user in data:
-                if user.get("emailAddress") == self.email:
-                    self.jira_username = user.get("name")
-                    print(f"  Found Jira username: {self.jira_username}", file=sys.stderr)
+                email = user.get("emailAddress", "")
+                if email and email.lower() == self.email.lower():
+                    # Cloud uses accountId, not name
+                    self.jira_username = user.get("accountId") or user.get("name")
+                    display = user.get("displayName", self.jira_username)
+                    print(f"  Found Jira user: {display} ({self.jira_username})", file=sys.stderr)
                     return
 
         print("  Could not find Jira user via API, will try discovery from issues", file=sys.stderr)
 
     def _discover_jira_username(self, issues: List[Dict]) -> None:
-        """Discover the Jira username from API responses (fallback method)."""
+        """Discover the Jira username/accountId from API responses (fallback method)."""
         if self.jira_username:
             return  # Already discovered
 
@@ -325,17 +396,17 @@ class JiraContributionAnalyzer:
 
             # Check reporter
             reporter = fields.get("reporter", {})
-            if reporter and reporter.get("emailAddress") == self.email:
-                # The 'name' field contains the Jira username
-                self.jira_username = reporter.get("name")
-                print(f"  Discovered Jira username: {self.jira_username}", file=sys.stderr)
+            if reporter and reporter.get("emailAddress", "").lower() == self.email.lower():
+                # Cloud uses accountId; Server used name
+                self.jira_username = reporter.get("accountId") or reporter.get("name")
+                print(f"  Discovered Jira user: {reporter.get('displayName', self.jira_username)}", file=sys.stderr)
                 return
 
             # Check assignee
             assignee = fields.get("assignee", {})
-            if assignee and assignee.get("emailAddress") == self.email:
-                self.jira_username = assignee.get("name")
-                print(f"  Discovered Jira username: {self.jira_username}", file=sys.stderr)
+            if assignee and assignee.get("emailAddress", "").lower() == self.email.lower():
+                self.jira_username = assignee.get("accountId") or assignee.get("name")
+                print(f"  Discovered Jira user: {assignee.get('displayName', self.jira_username)}", file=sys.stderr)
                 return
 
     async def fetch_tickets_reported(self) -> None:
@@ -417,9 +488,10 @@ class JiraContributionAnalyzer:
             # Extract verified date from changelog
             for entry in issue_data.get("_changelog", []):
                 author = entry.get("author", {})
-                author_name = author.get("name", "")
+                # Cloud uses accountId, Server used name
+                author_id = author.get("accountId") or author.get("name", "")
 
-                if author_name != self.jira_username:
+                if author_id != self.jira_username:
                     continue
 
                 created = entry.get("created", "")
@@ -702,17 +774,25 @@ def main():
 Examples:
     ./analyze-jira-contributions.py jparrill@redhat.com 2025-07-01 2025-09-30
     ./analyze-jira-contributions.py user@redhat.com 2025-01-01 2025-03-31 --github-prs-json /tmp/prs.json
+    ./analyze-jira-contributions.py antoni@redhat.com 2026-01-01 2026-03-31 --jira-email asegurap@redhat.com
 
 Environment variables:
-    JIRA_URL            Jira server URL (default: https://issues.redhat.com)
-    JIRA_API_TOKEN      Jira API token for authentication
-    JIRA_TOKEN          Alternative name for Jira API token
+    JIRA_URL            Jira Cloud URL (default: https://redhat.atlassian.net)
+    JIRA_USERNAME       Atlassian account email for Basic auth
+    JIRA_EMAIL          Alternative name for JIRA_USERNAME
+    JIRA_API_TOKEN      Jira API token (generate at https://id.atlassian.com/manage-profile/security/api-tokens)
+    JIRA_TOKEN          Alternative name for JIRA_API_TOKEN
         """,
     )
 
-    parser.add_argument("email", help="Developer's email address")
+    parser.add_argument("email", help="Developer's email address (used for Jira queries by default)")
     parser.add_argument("start_date", help="Start date (YYYY-MM-DD)")
     parser.add_argument("end_date", help="End date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--jira-email",
+        help="Separate Jira email if different from git email (e.g., asegurap@redhat.com vs antoni@redhat.com)",
+        default=None,
+    )
     parser.add_argument(
         "--github-prs-json",
         help="Path to JSON file with GitHub PR data for timing analysis",
@@ -746,11 +826,14 @@ Environment variables:
 
     # Check for Jira authentication
     if not JIRA_TOKEN:
-        print("Warning: No JIRA_API_TOKEN or JIRA_TOKEN set. Authentication may fail.", file=sys.stderr)
+        print("Warning: No JIRA_API_TOKEN or JIRA_TOKEN set. Authentication will fail.", file=sys.stderr)
+
+    # Use --jira-email if provided, otherwise fall back to positional email
+    jira_email = args.jira_email or args.email
 
     # Run analysis
     analyzer = JiraContributionAnalyzer(
-        email=args.email,
+        email=jira_email,
         start_date=args.start_date,
         end_date=args.end_date,
         github_prs=github_prs,

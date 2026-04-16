@@ -133,14 +133,20 @@ Step 3a: (If --jira flag is present) Analyze Jira contributions
 
 Check if `--jira` appears in any of the arguments. If present:
 
+IMPORTANT: Some developers use a different email for Jira than for git commits (e.g., `antoni@redhat.com` for git but `asegurap@redhat.com` for Jira). If the initial Jira query returns 0 results for a developer who is known to be active, ask the user for their Jira email and use the `--jira-email` flag.
+
 If quarter format:
 ```bash
 ./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> <START_DATE> <END_DATE> -o /tmp/jira_contributions.json
+# If Jira email differs from git email:
+./hack/tools/scripts/analyze-jira-contributions.py <GIT_EMAIL> <START_DATE> <END_DATE> --jira-email <JIRA_EMAIL> -o /tmp/jira_contributions.json
 ```
 
 If date range format:
 ```bash
 ./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> {{args.1}} {{args.2}} -o /tmp/jira_contributions.json
+# If Jira email differs from git email:
+./hack/tools/scripts/analyze-jira-contributions.py <GIT_EMAIL> {{args.1}} {{args.2}} --jira-email <JIRA_EMAIL> -o /tmp/jira_contributions.json
 ```
 
 Where START_DATE and END_DATE are derived from the quarter (Q1=Jan 1 to Mar 31, etc.)
@@ -157,8 +163,9 @@ This script outputs JSON with:
 - `pr_to_transition_timing`: Time between PR merge and ticket status transitions
 
 **Environment Requirements for Jira**:
-- `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable must be set
-- Token can be generated at https://issues.redhat.com (Profile → Personal Access Tokens)
+- `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable must be set (Atlassian Cloud API token)
+- `JIRA_USERNAME` or `JIRA_EMAIL` environment variable must be set (Atlassian account email for Basic auth)
+- Token can be generated at https://id.atlassian.com/manage-profile/security/api-tokens
 
 Step 4: Classify commits by topic
 
@@ -673,8 +680,12 @@ If validation errors are reported, fix them in the generated report before compl
 - Cross-repo searches are limited to 500 PRs for authored PRs and 200 for reviews (GitHub API limits)
 
 **Jira Analysis Notes** (when using --jira):
-- Requires `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable
-- Jira token can be generated at https://issues.redhat.com (Profile → Personal Access Tokens)
+- Requires `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable (Atlassian Cloud API token)
+- Also requires `JIRA_USERNAME` or `JIRA_EMAIL` for Basic auth (your Atlassian account email)
+- API tokens can be generated at https://id.atlassian.com/manage-profile/security/api-tokens
+- Jira Cloud URL: `https://redhat.atlassian.net` (migrated from `issues.redhat.com`)
+- Uses Jira Cloud REST API v3 (`/rest/api/3/search/jql` with POST and token-based pagination)
+- Some developers use a different email for Jira than for git -- use `--jira-email` flag if needed
 - Analyzes tickets in projects: OCPBUGS, CNTRLPLANE, HOSTEDCP, RFE, OCPSTRAT
 - Backport detection: Identifies tickets that are clones with a "depends on" link to the original
 - SFDC linkage: Uses custom fields `SFDC Cases Counter` and `SFDC Cases Links`
