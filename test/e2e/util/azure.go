@@ -19,7 +19,7 @@ import (
 
 func EnsureAzureWorkloadIdentityWebhookMutation(t *testing.T, ctx context.Context, guestClient crclient.Client) {
 	t.Run("EnsureAzureWorkloadIdentityWebhookMutation", func(t *testing.T) {
-		AtLeast(t, Version422)
+		AtLeast(t, Version420)
 		g := NewWithT(t)
 
 		nsName := fmt.Sprintf("azure-wi-e2e-%d", time.Now().UnixNano())
