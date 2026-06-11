@@ -167,10 +167,8 @@ func (o *Options) Validate() error {
 		o.ScaleFromZeroProvider = strings.ToLower(o.ScaleFromZeroProvider)
 	}
 
-	switch o.InstallScope {
-	case "", "all", "crds", "resources":
-	default:
-		errs = append(errs, fmt.Errorf("invalid --install-scope value %q: must be 'all', 'crds', or 'resources'", o.InstallScope))
+	if o.InstallScope != "" && !Outputs(o.InstallScope).IsValid() {
+		errs = append(errs, fmt.Errorf("invalid --install-scope value %q: must be '%s', '%s', or '%s'", o.InstallScope, OutputAll, OutputCRDs, OutputResources))
 	}
 
 	errs = append(errs, o.validatePlatformConfig()...)
@@ -477,7 +475,12 @@ func InstallHyperShiftOperator(ctx context.Context, out io.Writer, opts Options)
 		return err
 	}
 
-	if opts.InstallScope == "" || opts.InstallScope == "all" || opts.InstallScope == "crds" {
+	scope := Outputs(opts.InstallScope)
+	if scope == "" {
+		scope = OutputAll
+	}
+
+	if scope.IncludesCRDs() {
 		// Validate all CRDs via dry-run before applying
 		if err := dryRunValidateCRDs(ctx, out, crds); err != nil {
 			return err
@@ -523,7 +526,7 @@ func InstallHyperShiftOperator(ctx context.Context, out io.Writer, opts Options)
 		}
 	}
 
-	if opts.InstallScope == "" || opts.InstallScope == "all" || opts.InstallScope == "resources" {
+	if scope.IncludesResources() {
 		err = apply(ctx, out, objects)
 		if err != nil {
 			return err
