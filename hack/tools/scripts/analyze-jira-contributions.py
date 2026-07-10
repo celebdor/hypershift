@@ -67,6 +67,10 @@ BATCH_PAUSE_EVERY = 10       # Pause after every N requests
 BATCH_PAUSE_SECONDS = 1.0    # How long to pause
 
 
+def _chunk_keys(keys: List[str], size: int) -> List[List[str]]:
+    return [keys[i:i + size] for i in range(0, len(keys), size)]
+
+
 class JiraContributionAnalyzer:
     """Analyzes Jira contributions for a developer."""
 
@@ -289,19 +293,18 @@ class JiraContributionAnalyzer:
         return data.get("comments", []) if data else []
 
     async def _build_feature_mapping(self) -> None:
-        """Build CNTRLPLANE → OCPSTRAT mapping via top-down BFS.
+        """Build CNTRLPLANE → OCPSTRAT mapping via 3-pass top-down JQL.
 
-        Fetches OCPSTRAT features for Hosted Control Planes that had activity
-        in the analysis period, then walks down each feature's hierarchy to
-        discover CNTRLPLANE descendants. Builds a hashmap so that when we later
-        process a developer's tickets/PRs (which reference CNTRLPLANE keys in
-        their titles), we can look up the parent OCPSTRAT feature and its
-        business value in O(1).
+        Uses `parent in (...)` queries instead of per-ticket BFS, reducing
+        API requests from ~1300 to ~50.
+
+        Pass 1: Fetch OCPSTRAT features for Hosted Control Planes
+        Pass 2: Fetch CNTRLPLANE Epics whose parent is one of those features
+        Pass 3: Fetch CNTRLPLANE Stories/Tasks/Bugs whose parent is one of those Epics
         """
-        from collections import deque
-
         print("Building OCPSTRAT → CNTRLPLANE feature mapping...", file=sys.stderr)
 
+        # Pass 1: OCPSTRAT Features
         jql = (
             f'project = OCPSTRAT AND component = "Hosted Control Planes" '
             f'AND updated >= "{self.start_date}" '
@@ -310,56 +313,81 @@ class JiraContributionAnalyzer:
         features = await self._search_issues(
             jql,
             fields=f"summary,status,{FIELD_BUSINESS_VALUE},issuetype",
-            max_results=200,
+            max_results=500,
         )
+        print(f"  Pass 1: {len(features)} OCPSTRAT features", file=sys.stderr)
 
-        print(f"  Found {len(features)} active OCPSTRAT features in period", file=sys.stderr)
-
-        for feature in features:
-            feature_key = feature.get("key", "")
-            feature_fields = feature.get("fields", {})
-            feature_summary = feature_fields.get("summary", "")
-            feature_status = feature_fields.get("status", {}).get("name", "")
-
-            bv_field = feature_fields.get(FIELD_BUSINESS_VALUE)
+        feature_info: Dict[str, Dict] = {}
+        for f in features:
+            key = f.get("key", "")
+            flds = f.get("fields", {})
+            bv_field = flds.get(FIELD_BUSINESS_VALUE)
             bv = None
             if isinstance(bv_field, dict):
                 bv = bv_field.get("value")
             elif isinstance(bv_field, (int, float)):
                 bv = bv_field
-
-            # BFS down through children
-            descendant_keys: List[str] = []
-            queue: deque = deque([feature_key])
-            visited: Set[str] = {feature_key}
-
-            while queue:
-                current_key = queue.popleft()
-                children = await self._search_issues(
-                    f"parent = {current_key}", fields="key", max_results=500
-                )
-                for child in children:
-                    child_key = child.get("key", "")
-                    if child_key and child_key not in visited:
-                        visited.add(child_key)
-                        descendant_keys.append(child_key)
-                        queue.append(child_key)
-
-            mapping_entry = {
-                "ocpstrat_key": feature_key,
-                "ocpstrat_summary": feature_summary,
-                "ocpstrat_status": feature_status,
+            feature_info[key] = {
+                "ocpstrat_key": key,
+                "ocpstrat_summary": flds.get("summary", ""),
+                "ocpstrat_status": flds.get("status", {}).get("name", ""),
                 "business_value": bv,
             }
-            for desc_key in descendant_keys:
-                self.feature_mapping[desc_key] = mapping_entry
 
+        feature_keys = list(feature_info.keys())
+        if not feature_keys:
+            print("  No OCPSTRAT features found, skipping mapping", file=sys.stderr)
+            return
+
+        # Pass 2: Epics under those features
+        epic_to_feature: Dict[str, str] = {}
+        for chunk in _chunk_keys(feature_keys, 100):
+            keys_csv = ", ".join(chunk)
+            jql = (
+                f"project = CNTRLPLANE AND issuetype = Epic "
+                f"AND parent in ({keys_csv})"
+            )
+            epics = await self._search_issues(jql, fields="key,parent", max_results=5000)
+            for epic in epics:
+                epic_key = epic.get("key", "")
+                parent_key = (epic.get("fields", {}).get("parent") or {}).get("key", "")
+                if epic_key and parent_key in feature_info:
+                    epic_to_feature[epic_key] = parent_key
+                    self.feature_mapping[epic_key] = feature_info[parent_key]
+
+        print(f"  Pass 2: {len(epic_to_feature)} Epics under features", file=sys.stderr)
+
+        # Pass 3: Stories/Tasks/Bugs under those Epics
+        epic_keys = list(epic_to_feature.keys())
+        leaf_count = 0
+        if epic_keys:
+            for chunk in _chunk_keys(epic_keys, 100):
+                keys_csv = ", ".join(chunk)
+                jql = f"project = CNTRLPLANE AND parent in ({keys_csv})"
+                leaves = await self._search_issues(jql, fields="key,parent", max_results=5000)
+                for leaf in leaves:
+                    leaf_key = leaf.get("key", "")
+                    parent_key = (leaf.get("fields", {}).get("parent") or {}).get("key", "")
+                    if leaf_key and parent_key in epic_to_feature:
+                        ocpstrat_key = epic_to_feature[parent_key]
+                        self.feature_mapping[leaf_key] = feature_info[ocpstrat_key]
+                        leaf_count += 1
+
+        print(f"  Pass 3: {leaf_count} Stories/Tasks/Bugs under Epics", file=sys.stderr)
+
+        # Build features_summary
+        descendant_counts: Dict[str, int] = {}
+        for mapping in self.feature_mapping.values():
+            k = mapping["ocpstrat_key"]
+            descendant_counts[k] = descendant_counts.get(k, 0) + 1
+
+        for key, info in feature_info.items():
             self.features_summary.append({
-                "key": feature_key,
-                "summary": feature_summary,
-                "status": feature_status,
-                "business_value": bv,
-                "descendant_count": len(descendant_keys),
+                "key": key,
+                "summary": info["ocpstrat_summary"],
+                "status": info["ocpstrat_status"],
+                "business_value": info["business_value"],
+                "descendant_count": descendant_counts.get(key, 0),
             })
 
         print(
@@ -871,7 +899,10 @@ class JiraContributionAnalyzer:
         """Internal analysis runner."""
         # Build OCPSTRAT → CNTRLPLANE mapping first so _extract_issue_data
         # can annotate tickets with their parent feature and business value
-        await self._build_feature_mapping()
+        if not self.feature_mapping:
+            await self._build_feature_mapping()
+        else:
+            print(f"Using pre-loaded feature mapping ({len(self.feature_mapping)} entries)", file=sys.stderr)
 
         # Look up the Jira username directly via API
         await self._lookup_jira_user()
@@ -953,6 +984,11 @@ Environment variables:
         default=None,
     )
     parser.add_argument(
+        "--feature-mapping",
+        help="Path to a previous run's JSON output to reuse its feature_mapping (skips the ~3000-request BFS)",
+        default=None,
+    )
+    parser.add_argument(
         "--output",
         "-o",
         help="Output file path (default: stdout)",
@@ -985,6 +1021,19 @@ Environment variables:
     # Use --jira-email if provided, otherwise fall back to positional email
     jira_email = args.jira_email or args.email
 
+    # Load pre-built feature mapping if provided
+    preloaded_feature_mapping = None
+    preloaded_features_summary = None
+    if args.feature_mapping:
+        try:
+            with open(args.feature_mapping, "r") as f:
+                prev_data = json.load(f)
+            preloaded_feature_mapping = prev_data.get("feature_mapping", {})
+            preloaded_features_summary = prev_data.get("features_summary", [])
+            print(f"Loaded feature mapping from {args.feature_mapping} ({len(preloaded_feature_mapping)} entries)", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not load feature mapping: {e}. Will rebuild.", file=sys.stderr)
+
     # Run analysis
     analyzer = JiraContributionAnalyzer(
         email=jira_email,
@@ -992,6 +1041,10 @@ Environment variables:
         end_date=args.end_date,
         github_prs=github_prs,
     )
+
+    if preloaded_feature_mapping:
+        analyzer.feature_mapping = preloaded_feature_mapping
+        analyzer.features_summary = preloaded_features_summary or []
 
     if HAS_AIOHTTP:
         results = asyncio.run(analyzer.analyze())
