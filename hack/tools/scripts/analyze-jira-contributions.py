@@ -48,10 +48,14 @@ FIELD_SFDC_CASES_LINKS = "customfield_10979"
 FIELD_SFDC_CASES_OPEN = "customfield_10980"
 FIELD_TARGET_VERSION = "customfield_12319940"
 FIELD_TARGET_BACKPORT_VERSIONS = "customfield_12323940"
+FIELD_SEVERITY = "customfield_10840"
+FIELD_BUSINESS_VALUE = "customfield_10834"
 
 # Link type names (Cloud uses names, not numeric IDs)
 LINK_TYPE_CLONERS_NAME = "Cloners"
 LINK_TYPE_DEPEND_NAME = "Depend"
+LINK_TYPE_RELATED_NAME = "Related"
+LINK_TYPE_ACCOUNT_NAME = "Account"
 
 # Projects we care about
 JIRA_PROJECTS = ["OCPBUGS", "CNTRLPLANE", "HOSTEDCP", "RFE", "OCPSTRAT"]
@@ -81,6 +85,10 @@ class JiraContributionAnalyzer:
         self.tickets_verified: List[Dict] = []
         self.changelogs: Dict[str, List[Dict]] = {}
         self.backport_tickets: List[Dict] = []
+
+        # OCPSTRAT feature mapping: CNTRLPLANE-XXX -> {ocpstrat_key, summary, business_value}
+        self.feature_mapping: Dict[str, Dict] = {}
+        self.features_summary: List[Dict] = []
 
         # Session for async requests
         self.session: Optional[aiohttp.ClientSession] = None
@@ -207,9 +215,10 @@ class JiraContributionAnalyzer:
         "summary", "status", "resolution", "priority", "issuetype",
         "project", "created", "updated", "resolutiondate",
         "reporter", "assignee", "labels", "components", "issuelinks",
-        "comment",
+        "comment", "parent",
         FIELD_SFDC_CASES_COUNTER, FIELD_SFDC_CASES_LINKS, FIELD_SFDC_CASES_OPEN,
         FIELD_TARGET_VERSION, FIELD_TARGET_BACKPORT_VERSIONS,
+        FIELD_SEVERITY, FIELD_BUSINESS_VALUE,
     ]
 
     async def _search_issues(self, jql: str, fields: str = "*all", max_results: int = 100, expand: Optional[str] = None) -> List[Dict]:
@@ -279,14 +288,106 @@ class JiraContributionAnalyzer:
         data = await self._fetch_json(url)
         return data.get("comments", []) if data else []
 
+    async def _build_feature_mapping(self) -> None:
+        """Build CNTRLPLANE → OCPSTRAT mapping via top-down BFS.
+
+        Fetches OCPSTRAT features for Hosted Control Planes that had activity
+        in the analysis period, then walks down each feature's hierarchy to
+        discover CNTRLPLANE descendants. Builds a hashmap so that when we later
+        process a developer's tickets/PRs (which reference CNTRLPLANE keys in
+        their titles), we can look up the parent OCPSTRAT feature and its
+        business value in O(1).
+        """
+        from collections import deque
+
+        print("Building OCPSTRAT → CNTRLPLANE feature mapping...", file=sys.stderr)
+
+        jql = (
+            f'project = OCPSTRAT AND component = "Hosted Control Planes" '
+            f'AND updated >= "{self.start_date}" '
+            f'ORDER BY rank ASC'
+        )
+        features = await self._search_issues(
+            jql,
+            fields=f"summary,status,{FIELD_BUSINESS_VALUE},issuetype",
+            max_results=200,
+        )
+
+        print(f"  Found {len(features)} active OCPSTRAT features in period", file=sys.stderr)
+
+        for feature in features:
+            feature_key = feature.get("key", "")
+            feature_fields = feature.get("fields", {})
+            feature_summary = feature_fields.get("summary", "")
+            feature_status = feature_fields.get("status", {}).get("name", "")
+
+            bv_field = feature_fields.get(FIELD_BUSINESS_VALUE)
+            bv = None
+            if isinstance(bv_field, dict):
+                bv = bv_field.get("value")
+            elif isinstance(bv_field, (int, float)):
+                bv = bv_field
+
+            # BFS down through children
+            descendant_keys: List[str] = []
+            queue: deque = deque([feature_key])
+            visited: Set[str] = {feature_key}
+
+            while queue:
+                current_key = queue.popleft()
+                children = await self._search_issues(
+                    f"parent = {current_key}", fields="key", max_results=500
+                )
+                for child in children:
+                    child_key = child.get("key", "")
+                    if child_key and child_key not in visited:
+                        visited.add(child_key)
+                        descendant_keys.append(child_key)
+                        queue.append(child_key)
+
+            mapping_entry = {
+                "ocpstrat_key": feature_key,
+                "ocpstrat_summary": feature_summary,
+                "ocpstrat_status": feature_status,
+                "business_value": bv,
+            }
+            for desc_key in descendant_keys:
+                self.feature_mapping[desc_key] = mapping_entry
+
+            self.features_summary.append({
+                "key": feature_key,
+                "summary": feature_summary,
+                "status": feature_status,
+                "business_value": bv,
+                "descendant_count": len(descendant_keys),
+            })
+
+        print(
+            f"  Mapped {len(self.feature_mapping)} tickets to "
+            f"{len(self.features_summary)} OCPSTRAT features",
+            file=sys.stderr,
+        )
+
     def _extract_issue_data(self, issue: Dict) -> Dict:
-        """Extract relevant data from a Jira issue."""
+        """Extract relevant data from a Jira issue, including impact signals."""
         fields = issue.get("fields", {})
 
         # Extract SFDC case info
         sfdc_counter = fields.get(FIELD_SFDC_CASES_COUNTER) or 0
         sfdc_links = fields.get(FIELD_SFDC_CASES_LINKS)
         sfdc_open = fields.get(FIELD_SFDC_CASES_OPEN) or 0
+
+        # Extract severity (dropdown field)
+        severity_field = fields.get(FIELD_SEVERITY)
+        severity = severity_field.get("value") if isinstance(severity_field, dict) else None
+
+        # Extract business value (float field, typically on OCPSTRAT issues)
+        bv_field = fields.get(FIELD_BUSINESS_VALUE)
+        business_value = None
+        if isinstance(bv_field, dict):
+            business_value = bv_field.get("value")
+        elif isinstance(bv_field, (int, float)):
+            business_value = bv_field
 
         # Extract target version
         target_versions = fields.get(FIELD_TARGET_VERSION) or []
@@ -295,26 +396,52 @@ class JiraContributionAnalyzer:
         else:
             target_version_names = []
 
-        # Extract issue links for backport detection
+        # Extract issue links for backport detection and impact signals
         issue_links = fields.get("issuelinks", [])
         clones_link = None
         depends_on_link = None
+        rhocpprio_key = None
+        account_links = []
+        rosa_aro_dependents = []
 
         for link in issue_links:
             link_type = link.get("type", {})
             link_type_name = link_type.get("name", "")
 
-            # Check for clone relationship (match by name for Cloud)
-            if link_type_name == LINK_TYPE_CLONERS_NAME:
-                if "outwardIssue" in link:  # This issue clones another
-                    clones_link = link["outwardIssue"].get("key")
-                elif "inwardIssue" in link:  # This issue is cloned by another
-                    pass  # We care about "clones", not "is cloned by"
+            # Get linked issue key and summary from either direction
+            outward = link.get("outwardIssue", {})
+            inward = link.get("inwardIssue", {})
+            outward_key = outward.get("key", "") if outward else ""
+            inward_key = inward.get("key", "") if inward else ""
 
-            # Check for depends relationship
+            # Clone relationship (for backport detection)
+            if link_type_name == LINK_TYPE_CLONERS_NAME:
+                if outward_key:
+                    clones_link = outward_key
+
+            # Depend relationship
             if link_type_name == LINK_TYPE_DEPEND_NAME:
-                if "outwardIssue" in link:  # This issue depends on another
-                    depends_on_link = link["outwardIssue"].get("key")
+                if outward_key:
+                    depends_on_link = outward_key
+                # Check if a ROSA/ARO issue depends on this ticket
+                if inward_key and any(inward_key.startswith(p) for p in ("ROSA-", "ARO-")):
+                    rosa_aro_dependents.append(inward_key)
+
+            # Related links — check for RHOCPPRIO
+            if link_type_name == LINK_TYPE_RELATED_NAME:
+                for linked_key in (outward_key, inward_key):
+                    if linked_key and linked_key.startswith("RHOCPPRIO-"):
+                        rhocpprio_key = linked_key
+
+            # Account links — CIPOE tickets represent customer accounts
+            if link_type_name == LINK_TYPE_ACCOUNT_NAME:
+                for linked_issue in (outward, inward):
+                    if not linked_issue:
+                        continue
+                    lk = linked_issue.get("key", "")
+                    if lk.startswith("CIPOE-"):
+                        account_name = linked_issue.get("fields", {}).get("summary", "")
+                        account_links.append({"key": lk, "name": account_name})
 
         # Determine if this is a backport
         is_backport = False
@@ -323,8 +450,20 @@ class JiraContributionAnalyzer:
             is_backport = True
             cloned_from = clones_link
 
+        # Look up parent OCPSTRAT feature from the pre-built mapping
+        issue_key = issue.get("key", "")
+        mapping_entry = self.feature_mapping.get(issue_key)
+        parent_ocpstrat = None
+        mapped_bv = None
+        if mapping_entry:
+            parent_ocpstrat = mapping_entry.get("ocpstrat_key")
+            mapped_bv = mapping_entry.get("business_value")
+
+        # Use direct business value if present, otherwise use mapped value
+        effective_bv = business_value if business_value is not None else mapped_bv
+
         return {
-            "key": issue.get("key"),
+            "key": issue_key,
             "summary": fields.get("summary"),
             "status": fields.get("status", {}).get("name"),
             "resolution": fields.get("resolution", {}).get("name") if fields.get("resolution") else None,
@@ -344,6 +483,14 @@ class JiraContributionAnalyzer:
             "cloned_from": cloned_from,
             "labels": fields.get("labels", []),
             "components": [c.get("name") for c in fields.get("components", []) if isinstance(c, dict)],
+            "impact_signals": {
+                "severity": severity,
+                "rhocpprio_key": rhocpprio_key,
+                "account_links": account_links,
+                "rosa_aro_dependents": rosa_aro_dependents,
+                "business_value": effective_bv,
+                "parent_ocpstrat": parent_ocpstrat,
+            },
         }
 
     def _is_date_in_range(self, date_str: Optional[str]) -> bool:
@@ -722,7 +869,11 @@ class JiraContributionAnalyzer:
 
     async def _run_analysis(self) -> Dict:
         """Internal analysis runner."""
-        # First, try to look up the Jira username directly via API
+        # Build OCPSTRAT → CNTRLPLANE mapping first so _extract_issue_data
+        # can annotate tickets with their parent feature and business value
+        await self._build_feature_mapping()
+
+        # Look up the Jira username directly via API
         await self._lookup_jira_user()
 
         # Fetch reported and closed tickets in parallel (they're independent)
@@ -752,10 +903,13 @@ class JiraContributionAnalyzer:
                     "sfdc_cases_counter": ticket["sfdc_cases_counter"],
                     "sfdc_cases_links": ticket["sfdc_cases_links"],
                     "sfdc_cases_open": ticket["sfdc_cases_open"],
+                    "impact_signals": ticket.get("impact_signals", {}),
                 })
 
         return {
             "summary": summary,
+            "feature_mapping": self.feature_mapping,
+            "features_summary": self.features_summary,
             "tickets_reported": self.tickets_reported,
             "tickets_closed": self.tickets_closed,
             "tickets_verified": self.tickets_verified,

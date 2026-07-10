@@ -82,7 +82,7 @@ def get_github_username(email):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: resolve-developer.sh <name|email|username>", file=sys.stderr)
+        print("Usage: resolve-developer.py <name|email|username>", file=sys.stderr)
         print("Example: resolve-developer.sh 'Juan Manuel Parrilla'", file=sys.stderr)
         print("Example: resolve-developer.sh jparrill@redhat.com", file=sys.stderr)
         print("Example: resolve-developer.sh jparrill", file=sys.stderr)

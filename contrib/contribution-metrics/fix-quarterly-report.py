@@ -37,7 +37,7 @@ class ReportFixer:
     """Fixes and validates formatting in quarterly contribution reports."""
 
     # Jira ticket patterns
-    JIRA_PROJECTS = ['OCPBUGS', 'CNTRLPLANE', 'HOSTEDCP']
+    JIRA_PROJECTS = ['OCPBUGS', 'CNTRLPLANE', 'HOSTEDCP', 'RFE', 'OCPSTRAT', 'RHOCPPRIO']
     JIRA_URL_BASE = 'https://issues.redhat.com/browse'
 
     # GitHub organizations to handle

@@ -94,6 +94,31 @@ Check if `{{args.1}}` is in quarter format (Q[1-4]YYYY):
 - If YES: Use `{{args.1}}` for both start and end dates, and `{{args.2}}` is the output file
 - If NO: Use `{{args.1}}` as start date and `{{args.2}}` as end date, and `{{args.3}}` is the output file
 
+Step 1b: Collect team aggregate statistics
+
+```bash
+./hack/tools/scripts/analyze-team-stats.py <START_DATE> <END_DATE> -o /tmp/team_stats.json
+```
+
+Where START_DATE and END_DATE are derived from the quarter or explicit date range.
+The script auto-detects `OWNERS_ALIASES` in a sibling `hypershift/` directory. If running
+from a different location, pass `--owners-aliases <path>`.
+
+This script outputs JSON with:
+- `owners_aliases_members`: List of core team GitHub usernames
+- `commits`: Local commit counts per user (core team + all contributors)
+- `cross_repo_prs`: Cross-repo merged PR counts per core team member
+- `pr_reviews`: PR review counts per core team member
+- `verifications`: `/verified` comment counts per core team member
+  (only in openshift/hypershift, openshift/hypershift-oadp-plugin, openshift/enhancements)
+
+Each metric includes `core_team` and `all_contributors` cohorts with `total` and `by_user` breakdowns.
+
+Use these team totals to contextualize individual numbers in the report (see Step 6 template).
+When presenting team share numbers, state the fact without editorializing — e.g.,
+"45 commits (18% of core team's 250, core team average: 10)" lets the reader draw their
+own conclusion. Don't say "above average" or "below average" — the numbers speak.
+
 Step 2: Analyze commits using the helper script
 
 If quarter format:
@@ -107,9 +132,12 @@ If date range format:
 ```
 
 This outputs:
-- List of all commits in the local repository with hash, author, and subject
+- List of all commits in the primary (hypershift) repository with hash, author, and subject
 - Full commit details including body text for Jira ticket extraction
 - Cross-repository PRs authored by the developer (from all repos)
+- For each cross-repo PR's repository, if a sibling local clone exists in `../`,
+  the script fetches origin and outputs local commits from that repo too
+  (e.g., `../release/`, `../hypershift-oadp-plugin/`, `../enhancements/`)
 - Detailed PR information including body text and labels
 
 Step 3: Analyze PR reviews using the helper script
@@ -166,6 +194,77 @@ This script outputs JSON with:
 - `JIRA_API_TOKEN` or `JIRA_TOKEN` environment variable must be set (Atlassian Cloud API token)
 - `JIRA_USERNAME` or `JIRA_EMAIL` environment variable must be set (Atlassian account email for Basic auth)
 - Token can be generated at https://id.atlassian.com/manage-profile/security/api-tokens
+
+Step 3b: (If --jira flag is present) Assess impact signals from Jira data
+
+The Jira JSON output now includes `impact_signals` for each ticket, plus a `feature_mapping`
+(CNTRLPLANE → OCPSTRAT) and `features_summary`. Use these to determine which contributions
+carry the most business weight and should lead the report:
+
+**High-impact signals (should lead the report when present):**
+- `impact_signals.rhocpprio_key` is set → customer escalation that got executive attention.
+  Mention the RHOCPPRIO ticket and the linked account names from `impact_signals.account_links`.
+- `impact_signals.business_value` >= 7 (from parent OCPSTRAT via `feature_mapping`) →
+  strategically important feature. A developer delivering even one BV-9 feature has higher
+  impact than many routine fixes. Reference the OCPSTRAT ticket key and summary.
+- `sfdc_cases_counter` > 0 AND (`impact_signals.severity` Critical/Urgent OR priority
+  Blocker/Critical) → a customer filed a support case for a severe bug. Any SFDC linkage
+  means real customer impact; the severity/priority of the bug itself determines how
+  high-impact it is.
+- `impact_signals.rosa_aro_dependents` is non-empty → managed service teams (ROSA/ARO)
+  were blocked on this work.
+
+**Moderate-impact signals:**
+- `impact_signals.business_value` 4-6 → meaningful feature work.
+- `sfdc_cases_counter` > 0 with moderate severity/priority → customer-reported but not
+  critical. Still worth highlighting — any SFDC linkage means a real customer was affected.
+- `impact_signals.severity` Critical/Blocker without SFDC → serious bug but no customer
+  case filed yet.
+- `impact_signals.account_links` present → named customer impact (mention account names).
+
+**Context signals (inform narrative but don't drive emphasis):**
+- `is_backport` → usually derivative work; don't weight as heavily as original fixes.
+  **Two exceptions where backports ARE high-impact:**
+  1. Backports with `sfdc_cases_counter` > 0 → customers are waiting for this fix to
+     land in their version. The SFDC linkage means real urgency.
+  2. Backports whose parent chain reaches an OCPSTRAT feature (check
+     `impact_signals.parent_ocpstrat` or look up `cloned_from` in `feature_mapping`) →
+     high-stakes feature backport for a customer or product launch.
+- Ticket count per project → shows breadth across OCPBUGS/CNTRLPLANE/etc.
+- Verified tickets → shows QE/process contributions.
+
+Step 3c: Analyze pre-merge verification activity
+
+```bash
+./hack/tools/scripts/analyze-pr-verifications.py <GITHUB_USERNAME> <START_DATE> <END_DATE> -o /tmp/pr_verifications.json
+```
+
+This script outputs JSON with:
+- `summary`: Total verifications, cross vs self, with/without explanation, by type and repo
+- `verifications`: Each PR verified with classification:
+  - `is_cross_verification`: true if the developer verified someone else's PR (high value)
+  - `type`: `verified_by_user`, `verified_by_tests`, `verified_later`, or `verified`
+  - `has_explanation`: whether the comment includes a substantive explanation of what was tested
+  - `explanation`: the explanation text (if present)
+  - `pr_authors_verified`: which teammates' PRs were verified (shows collaboration breadth)
+
+**Verification quality ranking (for the report narrative):**
+1. **Cross-verification with explanation** — gold standard: verified someone else's PR AND
+   documented what was tested and how.
+2. **Cross-verification by tests with explanation** — strong: verified via unit/e2e tests AND
+   explained which tests cover the change and why they're sufficient (e.g., "TestNodePoolAutoScaling
+   exercises this code path because...").
+3. **Cross-verification without explanation** — still valuable: shows the behavior of verifying
+   teammates' work, but the verification is less auditable.
+4. **Self-verification with explanation** — expected practice: good documentation of coverage.
+5. **Self-verification by tests with explanation** — acceptable: points to specific test coverage
+   with reasoning, on own PR.
+6. **`/verified by unit/e2e tests` without explanation** — weak: claims test coverage but doesn't
+   say which tests or why they're sufficient. Not much better than no verification.
+7. **Self-verification without explanation** — minimal value: `/verified` on your own PR without
+   saying what was tested.
+8. **`/verified later`** — deferred: the developer committed to verifying post-merge. Track but
+   note it's a promise, not a completed verification.
 
 Step 4: Classify commits by topic
 
@@ -251,7 +350,29 @@ Step 6: Generate the comprehensive report
 - Keep impact statements factual and matter-of-fact
 - Focus on what was accomplished, not how amazing it was
 
-**REPORT FORMAT** (use this exact structure):
+**REPORT STRUCTURE — Adaptive Ordering:**
+
+The report always starts with Executive Summary and ends with Overall Assessment + Conclusion.
+The middle sections should be ordered by business impact weight based on the signals from Step 3b:
+
+1. **Executive Summary** (always first) — adapt the narrative to highlight the highest-impact work
+2-6. **Middle sections** — order these based on which has the strongest impact signals:
+   - **Customer Impact & Escalations** → lead with this if RHOCPPRIO tickets, high-severity SFDC
+     bugs, or customer-facing backports exist. Merge with Jira Contribution Activity if both present.
+   - **Feature Delivery** → lead with this if OCPSTRAT features with business_value >= 4 were
+     delivered. Frame around strategic contribution, reference OCPSTRAT keys and business values.
+   - **Commit Analysis** → always present; lead with it if no strong Jira signals exist.
+   - **Pre-Merge Verification Activity** → always present when data exists; highlight cross-
+     verification work prominently as it demonstrates quality culture adoption.
+   - **PR Review Activity** → always present.
+   - **Jira Contribution Activity** → include if --jira flag was used.
+7. **Overall Assessment** (always second-to-last)
+8. **Conclusion** (always last)
+
+If neither escalations nor features dominate, fall back to the default ordering
+(Commit Analysis → Jira → Verification → Reviews → Assessment → Conclusion).
+
+**REPORT FORMAT** (use these section templates as guidance, ordering per above):
 
 ```markdown
 # Q3 2025 Quarterly Contribution Report
@@ -265,7 +386,7 @@ Step 6: Generate the comprehensive report
 
 ## Executive Summary
 
-[Developer] demonstrated [high/substantial/significant] productivity and technical leadership in Q3 2025, with [significant/substantial] contributions across [main areas]. [He/She] authored **XX local commits** in HyperShift [(highest/second highest/etc.) in team], actively reviewed **XX PRs** across X different repositories, and delivered [substantial/significant] contributions including [list major achievements]. [His/Her] work represents both [strong/substantial] individual output and team enablement through [documentation/tooling/etc.].
+[Developer] demonstrated [high/substantial/significant] productivity and technical leadership in Q3 2025, with [significant/substantial] contributions across [main areas]. [He/She] authored **XX commits** across [N repos] (YY% of core team total, ZZ% of all contributors), actively reviewed **XX PRs** (YY% of core team reviews), and delivered [substantial/significant] contributions including [list major achievements].
 
 ### Key Achievements
 - **[Area 1]:** [Brief description of major work]
@@ -280,9 +401,11 @@ Step 6: Generate the comprehensive report
 ## Commit Analysis
 
 ### Summary
-- **Total Local Commits:** XX [(highest/second/etc.) in team for Q3]
-- **Total Cross-Repo PRs:** XX
+- **Total Commits:** XX across N repos (YY% of core team's ZZ | AA% of all contributors' BB)
+- **Total Cross-Repo PRs:** XX (YY% of core team's ZZ cross-repo PRs)
+- **Repos:** [list repos where commits were found, e.g. hypershift, release, enhancements]
 - **Date Range:** July 1 - September 30, 2025
+- **Core Team Average:** ZZ commits (from /tmp/team_stats.json)
 - **Primary Focus Areas:** [List 3-5 main areas]
 
 ### Commits by Topic
@@ -337,14 +460,19 @@ Step 6: Generate the comprehensive report
 
 ### Customer Impact (SFDC-Linked Tickets)
 
-Tickets with linked customer cases demonstrate direct customer impact:
+Tickets with linked customer cases demonstrate direct customer impact.
+Order by severity/priority (Critical/Blocker first), then by SFDC case count:
 
 1. **[OCPBUGS-XXX](https://issues.redhat.com/browse/OCPBUGS-XXX)**: [Summary]
+   - **Priority:** [Priority] | **Severity:** [Severity]
    - **SFDC Cases:** X linked cases
+   - **Escalation:** [RHOCPPRIO-XXX](https://issues.redhat.com/browse/RHOCPPRIO-XXX) (if linked)
+   - **Accounts:** [Account names from CIPOE links, if any]
    - **Status:** [Current status]
    - **Impact:** [Description of customer impact]
 
 2. **[OCPBUGS-YYY](https://issues.redhat.com/browse/OCPBUGS-YYY)**: [Summary]
+   - **Priority:** [Priority] | **Severity:** [Severity]
    - **SFDC Cases:** X linked cases
    - **Status:** [Current status]
 
@@ -383,13 +511,49 @@ Notable transitions:
 
 ---
 
+## Pre-Merge Verification Activity
+
+### Summary
+- **Total Verifications:** XX (YY% of core team's ZZ verifications)
+- **Cross-Verifications (others' PRs):** XX (XX%)
+- **Self-Verifications:** XX (XX%)
+- **With Substantive Explanation:** XX (XX%)
+- **Core Team Average:** ZZ verifications (from /tmp/team_stats.json)
+- **Teammates Verified:** [list of GitHub usernames whose PRs were verified]
+
+### Verification Quality Breakdown
+
+**Cross-Verifications with Explanation (Gold Standard):**
+1. [org/repo#number](URL) - [title] (author: @author)
+   - **Explanation:** [summary of what was tested and how]
+
+**Cross-Verifications without Explanation:**
+1. [org/repo#number](URL) - [title] (author: @author)
+
+**Self-Verifications:**
+[List notable self-verifications, especially those with good explanations]
+
+**Deferred Verifications (`/verified later`):**
+[List any, noting these are promises not completed verifications]
+
+### Verification Patterns
+[Describe the developer's verification behavior:]
+- How often they verify others' PRs vs. their own
+- Quality of explanations when provided
+- Which teammates' work they most often verify
+- Whether verification is thorough (covering edge cases, running manual tests,
+  referencing specific test names) or perfunctory
+
+---
+
 ## PR Review Activity
 
 ### Summary Statistics
-- **Total PRs Reviewed:** XX PRs (excluding own PRs: XX)
+- **Total PRs Reviewed:** XX PRs (YY% of core team's ZZ reviews | excluding own PRs: XX)
 - **Repositories Covered:** X (repo1, repo2, repo3)
 - **Review Period:** Q3 2025
 - **Unique Contributors:** XX developers
+- **Core Team Average:** ZZ reviews (from /tmp/team_stats.json)
 
 ### Review Depth Analysis
 
@@ -550,13 +714,13 @@ Notable transitions:
 - [Strength 5]
 - [Strength 6]
 
-**Q3 2025 Impact Rating: ⭐⭐⭐⭐⭐ (High Impact)**
-[or ⭐⭐⭐⭐ (Strong Impact) or other appropriate rating]
-
----
-
-**Summary:**
-[1-2 sentences summarizing the developer's quarter with specific numbers and key accomplishments]
+**Impact Summary:**
+[2-3 sentence qualitative summary referencing actual impact signals from the data. E.g.:
+"[Developer]'s Q3 contributions had direct customer impact — resolving X SFDC-linked bugs
+including [RHOCPPRIO-escalated tickets affecting Account Names] — and strategic value through
+delivering [OCPSTRAT-XXXX] (Business Value N). [His/Her] XX commits represent YY% of core
+team output, with ZZ% of team PR reviews." Reference specific numbers, tickets, and team
+share percentages rather than a star rating.]
 ```
 
 **IMPORTANT FORMATTING RULES**:

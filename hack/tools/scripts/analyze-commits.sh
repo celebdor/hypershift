@@ -86,36 +86,106 @@ if $GH_AVAILABLE && ! command -v jq &> /dev/null; then
     GH_AVAILABLE=false
 fi
 
-# Get commits with full details
-echo "=== LOCAL REPO COMMITS ==="
-git log --author="$EMAIL" --since="$START_DATE" --until="$END_DATE" --no-merges \
+# Determine the repo root and parent directory for sibling clone discovery
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+REPO_NAME=$(basename "$REPO_ROOT" 2>/dev/null || echo "")
+PARENT_DIR=$(dirname "$REPO_ROOT" 2>/dev/null || echo "")
+
+# Search for PRs first — we use PR commit data to discover the git author email
+GIT_EMAIL="$EMAIL"
+
+if $GH_AVAILABLE; then
+    # Search for merged PRs authored by the user in the date range
+    CROSS_REPO_JSON=$(gh search prs --author="$GITHUB_USER" --merged --json number,title,repository,url,closedAt --limit 500)
+
+    # Pick the first in-range PR to extract the actual git commit email
+    FIRST_PR=$(echo "$CROSS_REPO_JSON" | \
+        jq -r --arg start "$START_DATE" --arg end "$END_DATE" \
+        '[.[] | select(.closedAt >= $start and .closedAt <= ($end + "T23:59:59Z"))] | first | "\(.repository.nameWithOwner)|\(.number)"' 2>/dev/null || echo "")
+
+    if [ -n "$FIRST_PR" ] && [ "$FIRST_PR" != "null|null" ]; then
+        IFS='|' read -r first_repo first_number <<< "$FIRST_PR"
+        COMMIT_EMAIL=$(gh pr view "$first_number" --repo "$first_repo" --json commits \
+            --jq ".commits[0].authors[0].email // empty" 2>/dev/null || echo "")
+        if [ -n "$COMMIT_EMAIL" ] && [ "$COMMIT_EMAIL" != "$GIT_EMAIL" ]; then
+            echo "Discovered git commit email from PR: $COMMIT_EMAIL (argument was $EMAIL)" >&2
+            GIT_EMAIL="$COMMIT_EMAIL"
+        fi
+    fi
+fi
+
+# Get commits from the current (primary) local repo using the resolved email
+echo "=== LOCAL REPO COMMITS ($REPO_NAME) ==="
+git log --author="$GIT_EMAIL" --since="$START_DATE" --until="$END_DATE" --no-merges \
     --pretty=format:"%h|%an|%s" --date=short
 
 echo ""
 echo ""
-echo "=== LOCAL REPO COMMIT DETAILS ==="
-git log --author="$EMAIL" --since="$START_DATE" --until="$END_DATE" --no-merges \
+echo "=== LOCAL REPO COMMIT DETAILS ($REPO_NAME) ==="
+git log --author="$GIT_EMAIL" --since="$START_DATE" --until="$END_DATE" --no-merges \
     --pretty=format:"%h|%an|%s%n%b%n---" --date=short
 
-# Search for PRs authored across all repositories
+# Continue with cross-repo PR output and sibling repo discovery
 if $GH_AVAILABLE; then
     echo ""
     echo ""
     echo "=== CROSS-REPO PRS AUTHORED ==="
 
-    # Search for merged PRs authored by the user in the date range
-    # For merged PRs, closedAt is the merge date
-    gh search prs --author="$GITHUB_USER" --merged --json number,title,repository,url,closedAt --limit 500 | \
+    echo "$CROSS_REPO_JSON" | \
         jq -r --arg start "$START_DATE" --arg end "$END_DATE" \
         '.[] | select(.closedAt >= $start and .closedAt <= ($end + "T23:59:59Z")) | "\(.repository.nameWithOwner)|\(.number)|\(.title)|\(.url)|\(.closedAt)"' | \
         sort
+
+    # Discover sibling local clones from cross-repo PR data
+    # Extract unique repo basenames (excluding the primary repo)
+    SIBLING_REPOS=$(echo "$CROSS_REPO_JSON" | \
+        jq -r --arg start "$START_DATE" --arg end "$END_DATE" --arg primary "$REPO_NAME" \
+        '[.[] | select(.closedAt >= $start and .closedAt <= ($end + "T23:59:59Z")) | .repository.name] | unique | .[] | select(. != $primary)' 2>/dev/null || echo "")
+
+    if [ -n "$SIBLING_REPOS" ] && [ -n "$PARENT_DIR" ]; then
+        while IFS= read -r sibling; do
+            [ -z "$sibling" ] && continue
+            SIBLING_PATH="$PARENT_DIR/$sibling"
+
+            if [ -d "$SIBLING_PATH/.git" ] || git -C "$SIBLING_PATH" rev-parse --git-dir &>/dev/null 2>&1; then
+                echo "" >&2
+                echo "Found local clone for $sibling at $SIBLING_PATH — fetching and scanning commits..." >&2
+
+                # Fetch latest from origin to ensure we have recent commits
+                git -C "$SIBLING_PATH" fetch origin --quiet 2>/dev/null || true
+
+                SIBLING_COMMITS=$(git -C "$SIBLING_PATH" log --author="$GIT_EMAIL" \
+                    --since="$START_DATE" --until="$END_DATE" --no-merges \
+                    --pretty=format:"%h|%an|%s" --date=short --all 2>/dev/null || echo "")
+
+                if [ -n "$SIBLING_COMMITS" ]; then
+                    SIBLING_COUNT=$(echo "$SIBLING_COMMITS" | wc -l)
+                    echo ""
+                    echo ""
+                    echo "=== LOCAL REPO COMMITS ($sibling) ==="
+                    echo "$SIBLING_COMMITS"
+
+                    echo ""
+                    echo ""
+                    echo "=== LOCAL REPO COMMIT DETAILS ($sibling) ==="
+                    git -C "$SIBLING_PATH" log --author="$GIT_EMAIL" \
+                        --since="$START_DATE" --until="$END_DATE" --no-merges \
+                        --pretty=format:"%h|%an|%s%n%b%n---" --date=short --all 2>/dev/null || true
+
+                    echo "Found $SIBLING_COUNT commits in $sibling" >&2
+                else
+                    echo "No commits found in $sibling for $GIT_EMAIL" >&2
+                fi
+            fi
+        done <<< "$SIBLING_REPOS"
+    fi
 
     echo ""
     echo ""
     echo "=== CROSS-REPO PR DETAILS ==="
 
     # Get detailed information for each PR
-    PR_DATA=$(gh search prs --author="$GITHUB_USER" --merged --json number,repository,closedAt --limit 500 | \
+    PR_DATA=$(echo "$CROSS_REPO_JSON" | \
         jq -r --arg start "$START_DATE" --arg end "$END_DATE" \
         '.[] | select(.closedAt >= $start and .closedAt <= ($end + "T23:59:59Z")) | "\(.repository.nameWithOwner)|\(.number)"')
 
