@@ -184,7 +184,18 @@ The tool uses three helper scripts:
    - Fetches your cross-repository PRs via GitHub API
    - Includes rate limiting to avoid API throttling
 
-3. **Review Analysis** (`hack/tools/scripts/analyze_pr_reviews.py`)
+3. **Org-wide PR-based Commit Analysis** (`hack/tools/scripts/analyze-pr-based-commits.py`)
+   - Counts hand-authored commits across **all branches of all repos** in the
+     openshift + openshift-eng orgs, gathered from each person's merged PRs
+     (a PR's commits, deduped by SHA, filtered to those the person authored in-window)
+   - Captures release-branch backports that `gh search commits` (default-branch only)
+     misses, without cloning ~1k repos; measured against the team roster so its
+     share/multiplier are comparable to the review row
+   - PR-gated: commits merged via a PR the person did not author (e.g. a
+     cherry-pick-robot backport) are not attributed; bot-driven PRs never count
+     toward hand-authored commits
+
+4. **Review Analysis** (`hack/tools/scripts/analyze_pr_reviews.py`)
    - Gathers your entire quarter of PR engagement in bulk via GraphQL (reviews and
      conversation comments inlined per PR), then classifies each PR locally
    - Counts genuine reviews of others' PRs — formal reviews, inline comments,
@@ -196,7 +207,7 @@ The tool uses three helper scripts:
 
 The Claude Code command orchestrates these scripts, analyzes the data, categorizes contributions, and generates a comprehensive markdown report.
 
-4. **Report Formatter** (`contrib/contribution-metrics/fix-quarterly-report.py`)
+5. **Report Formatter** (`contrib/contribution-metrics/fix-quarterly-report.py`)
    - Validates and fixes common formatting issues
    - Auto-links Jira tickets and GitHub PR references
    - Fixes asterisk-based impact ratings to emoji stars
