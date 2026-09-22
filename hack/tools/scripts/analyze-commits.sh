@@ -6,6 +6,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [ $# -lt 3 ]; then
     echo "Usage: $0 <email> <github-username> <quarter-or-start-date> [end-date]" >&2
     echo "Example: $0 jparrill@redhat.com jparrill Q32025" >&2
@@ -107,6 +109,15 @@ if $GH_AVAILABLE; then
         IFS='|' read -r first_repo first_number <<< "$FIRST_PR"
         COMMIT_EMAIL=$(gh pr view "$first_number" --repo "$first_repo" --json commits \
             --jq ".commits[0].authors[0].email // empty" 2>/dev/null || echo "")
+        # Never adopt a bot merge-account email. When a contributor's PRs are opened
+        # by automation (chai-bot, jira-solve-bot, renovate, cherry-pick robot, …)
+        # the first commit's author is the bot, not the human — adopting it would
+        # scan the wrong identity and drop all the human's real commits. In that
+        # case keep the operator-provided $EMAIL, which is authoritative.
+        if echo "$COMMIT_EMAIL" | grep -qiE '(chai-bot|jira-solve|renovate|dependabot|cherrypick|noreply|actions@github|bot@)'; then
+            echo "Ignoring discovered bot commit email ($COMMIT_EMAIL); keeping $EMAIL" >&2
+            COMMIT_EMAIL=""
+        fi
         if [ -n "$COMMIT_EMAIL" ] && [ "$COMMIT_EMAIL" != "$GIT_EMAIL" ]; then
             echo "Discovered git commit email from PR: $COMMIT_EMAIL (argument was $EMAIL)" >&2
             GIT_EMAIL="$COMMIT_EMAIL"
@@ -199,5 +210,38 @@ if $GH_AVAILABLE; then
 
             echo "---"
         done <<< "$PR_DATA"
+    fi
+
+    # Bot-driven PRs: Chai Bot / jira-solve-bot open PRs on a human's behalf, so they
+    # never surface under --author. Always attribute them to their human driver and
+    # surface the ones driven by this developer. The attribution JSON is shared across
+    # developers (one scan per quarter), cached under the XDG state dir.
+    echo ""
+    echo ""
+    echo "=== BOT-DRIVEN PRS ==="
+
+    BOT_ATTRIBUTION_JSON="${BOT_ATTRIBUTION_JSON:-${XDG_STATE_HOME:-$HOME/.local/state}/quarterly-analysis/chai_bot_attr.json}"
+
+    if [ ! -f "$BOT_ATTRIBUTION_JSON" ]; then
+        if [ -n "${ROSTER_YAML:-}" ] && [ -f "${ROSTER_YAML:-}" ]; then
+            echo "Generating bot attribution → $BOT_ATTRIBUTION_JSON" >&2
+            mkdir -p "$(dirname "$BOT_ATTRIBUTION_JSON")"
+            OVERRIDES_ARG=()
+            if [ -n "${BOT_OVERRIDES_JSON:-}" ] && [ -f "${BOT_OVERRIDES_JSON:-}" ]; then
+                OVERRIDES_ARG=(--overrides "$BOT_OVERRIDES_JSON")
+            fi
+            python3 "$SCRIPT_DIR/analyze-chai-bot-attribution.py" \
+                "$ROSTER_YAML" "$START_DATE" "$END_DATE" \
+                "${OVERRIDES_ARG[@]}" -o "$BOT_ATTRIBUTION_JSON" >&2 || \
+                echo "Warning: bot attribution generation failed" >&2
+        else
+            echo "No bot attribution file at $BOT_ATTRIBUTION_JSON and ROSTER_YAML unset — skipping" >&2
+        fi
+    fi
+
+    if [ -f "$BOT_ATTRIBUTION_JSON" ]; then
+        jq -r --arg user "$GITHUB_USER" \
+            '.resolved[] | select((.github // "") | ascii_downcase == ($user | ascii_downcase)) | "\(.repo)#\(.number)|\(.title)|\(.url)|bot=\(.bot)|via \(.method)"' \
+            "$BOT_ATTRIBUTION_JSON" 2>/dev/null | sort || echo "No bot-driven PRs found for $GITHUB_USER"
     fi
 fi

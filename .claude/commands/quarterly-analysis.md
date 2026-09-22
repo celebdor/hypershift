@@ -94,20 +94,59 @@ Check if `{{args.1}}` is in quarter format (Q[1-4]YYYY):
 - If YES: Use `{{args.1}}` for both start and end dates, and `{{args.2}}` is the output file
 - If NO: Use `{{args.1}}` as start date and `{{args.2}}` as end date, and `{{args.3}}` is the output file
 
+**State directory**: intermediate JSON (team stats, bot attribution, Jira, verifications)
+is written under the XDG state directory, NOT `/tmp`. Define it once and reuse:
+
+```bash
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/quarterly-analysis"
+mkdir -p "$STATE_DIR"
+```
+
+All `$STATE_DIR/...` paths below refer to this location. Reuse the same files across
+every developer in a quarter — the team-wide scans (team stats, bot attribution) are
+computed once and shared, so only regenerate them if the date range changes.
+
+Step 1a: Attribute bot-driven PRs to their human driver (ALWAYS run)
+
+Chai Bot (`redhat-chai-bot`) and jira-solve-bot open PRs on a human's behalf. Those PRs
+are authored by the bot account, so the author-keyed searches in Steps 1b/2 miss them
+entirely. This scan resolves each merged bot PR back to the roster member who drove it
+(via body `@x requested`, the linked Jira ticket's assignee/reporter, or an overrides
+file) and MUST always run — it is not optional.
+
+```bash
+./hack/tools/scripts/analyze-chai-bot-attribution.py <ROSTER_YAML> <START_DATE> <END_DATE> \
+    --overrides <OVERRIDES_JSON> -o "$STATE_DIR/chai_bot_attr.json"
+```
+
+- `<ROSTER_YAML>`: the quarter's roster file (maps GitHub login/email/name to people).
+- `--overrides <OVERRIDES_JSON>`: optional; a JSON map of `pr_url -> github_login | "ignore"
+  | "unattributed"` for PRs that need a manual decision. Omit if none.
+- The output buckets PRs into `resolved` (attributed to a roster member), `off_roster`,
+  `self_improvement`, `needs_review`, and `ignored`. Review `needs_review`/`off_roster`
+  and feed decisions back via the overrides file, then re-run.
+
 Step 1b: Collect team aggregate statistics
 
 ```bash
-./hack/tools/scripts/analyze-team-stats.py <START_DATE> <END_DATE> -o /tmp/team_stats.json
+./hack/tools/scripts/analyze-team-stats.py <START_DATE> <END_DATE> \
+    --roster <ROSTER_YAML> --bot-attribution "$STATE_DIR/chai_bot_attr.json" \
+    -o "$STATE_DIR/team_stats.json"
 ```
 
 Where START_DATE and END_DATE are derived from the quarter or explicit date range.
 The script auto-detects `OWNERS_ALIASES` in a sibling `hypershift/` directory. If running
-from a different location, pass `--owners-aliases <path>`.
+from a different location, pass `--owners-aliases <path>`. It always folds bot-driven PRs
+into each member's cross-repo PR count: pass `--bot-attribution` to reuse the file from
+Step 1a, or `--roster` alone to have it generate the attribution on demand.
 
 This script outputs JSON with:
 - `owners_aliases_members`: List of core team GitHub usernames
 - `commits`: Local commit counts per user (core team + all contributors)
-- `cross_repo_prs`: Cross-repo merged PR counts per core team member
+- `cross_repo_prs`: Cross-repo merged PR counts per core team member. Split into:
+  - `core_team`: **combined** total (authored + bot-driven) per member
+  - `authored`: PRs the member authored directly under their own account
+  - `bot_driven`: PRs driven by the member but pushed by a bot (from Step 1a)
 - `pr_reviews`: PR review counts per core team member
 - `verifications`: `/verified` comment counts per core team member
   (only in openshift/hypershift, openshift/hypershift-oadp-plugin, openshift/enhancements)
@@ -120,6 +159,15 @@ When presenting team share numbers, state the fact without editorializing — e.
 own conclusion. Don't say "above average" or "below average" — the numbers speak.
 
 Step 2: Analyze commits using the helper script
+
+Export the roster and bot-attribution paths first so the script can surface this
+developer's bot-driven PRs (it reuses the Step 1a file rather than regenerating):
+
+```bash
+export ROSTER_YAML=<ROSTER_YAML>
+export BOT_ATTRIBUTION_JSON="$STATE_DIR/chai_bot_attr.json"
+export BOT_OVERRIDES_JSON=<OVERRIDES_JSON>   # optional
+```
 
 If quarter format:
 ```bash
@@ -139,23 +187,40 @@ This outputs:
   the script fetches origin and outputs local commits from that repo too
   (e.g., `../release/`, `../hypershift-oadp-plugin/`, `../enhancements/`)
 - Detailed PR information including body text and labels
+- A `=== BOT-DRIVEN PRS ===` section listing PRs this developer drove but which a bot
+  (Chai Bot / jira-solve-bot) pushed on their behalf, with the repo, title, URL, the bot,
+  and the attribution method. These count toward the developer's **PR count**, never their
+  hand-authored **commit count** (the commits belong to the bot account).
 
-Step 3: Analyze PR reviews using the helper script
+Step 3: Analyze PR reviews using the classifier
 
-If quarter format:
 ```bash
-./hack/tools/scripts/analyze-pr-reviews.sh <GITHUB_USERNAME> {{args.1}} {{args.1}}
+./hack/tools/scripts/analyze_pr_reviews.py <GITHUB_USERNAME> <START_DATE> <END_DATE> \
+  -o "$STATE_DIR/<GITHUB_USERNAME>-reviews.json"
 ```
+(Use the resolved START/END dates — quarter args like `Q32026` must be expanded to
+`YYYY-MM-DD` first.)
 
-If date range format:
-```bash
-./hack/tools/scripts/analyze-pr-reviews.sh <GITHUB_USERNAME> {{args.1}} {{args.2}}
-```
+This gathers the contributor's entire quarter of PR engagement in bulk via GraphQL
+(reviews and conversation comments inlined per PR) and classifies each PR into:
+`review`, `command_only`, `trivial_only`, `own_pr`, `off_org`, `no_inwindow`.
 
-This outputs:
-- List of all PRs reviewed
-- Review states and comments for each PR
-- Sample of inline code review comments
+**The accurate review count is `.counts.review`** — genuine reviews of *others'*
+PRs (a formal review, an inline code comment, a `/lgtm`/`/approve`, or substantive
+prose) on team-relevant repos, dated in-window. It deliberately EXCLUDES:
+- the contributor's own PRs (`own_pr`),
+- bare Prow/CI slash-commands with no substance — `/override`, `/retest`, `/test`,
+  `/cherry-pick`, `/retitle`, `/cc`, `/uncc`, `/pipeline` … (`command_only`),
+- personal/off-team repos not in the org allowlist (`off_org`),
+- PRs whose activity actually falls outside the window (`no_inwindow`).
+
+This matches the methodology used for the team-wide denominator in
+`team_stats.json` (`pr_reviews.method == "classified-v2"`), so `% of core team`
+comparisons are valid. The `.buckets.review[]` records carry full review/inline/prose
+bodies, states, the reviewee (`author`), and repo — use them for the depth and topic
+analysis in Step 5. (The legacy `--reviewed-by --merged` shell script is retired:
+it counted only formal reviews on merged openshift-org PRs and undercounted everyone,
+leads worst.)
 
 Step 3a: (If --jira flag is present) Analyze Jira contributions
 
@@ -165,16 +230,16 @@ IMPORTANT: Some developers use a different email for Jira than for git commits (
 
 If quarter format:
 ```bash
-./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> <START_DATE> <END_DATE> -o /tmp/jira_contributions.json
+./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> <START_DATE> <END_DATE> -o "$STATE_DIR/jira_contributions.json"
 # If Jira email differs from git email:
-./hack/tools/scripts/analyze-jira-contributions.py <GIT_EMAIL> <START_DATE> <END_DATE> --jira-email <JIRA_EMAIL> -o /tmp/jira_contributions.json
+./hack/tools/scripts/analyze-jira-contributions.py <GIT_EMAIL> <START_DATE> <END_DATE> --jira-email <JIRA_EMAIL> -o "$STATE_DIR/jira_contributions.json"
 ```
 
 If date range format:
 ```bash
-./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> {{args.1}} {{args.2}} -o /tmp/jira_contributions.json
+./hack/tools/scripts/analyze-jira-contributions.py <EMAIL> {{args.1}} {{args.2}} -o "$STATE_DIR/jira_contributions.json"
 # If Jira email differs from git email:
-./hack/tools/scripts/analyze-jira-contributions.py <GIT_EMAIL> {{args.1}} {{args.2}} --jira-email <JIRA_EMAIL> -o /tmp/jira_contributions.json
+./hack/tools/scripts/analyze-jira-contributions.py <GIT_EMAIL> {{args.1}} {{args.2}} --jira-email <JIRA_EMAIL> -o "$STATE_DIR/jira_contributions.json"
 ```
 
 Where START_DATE and END_DATE are derived from the quarter (Q1=Jan 1 to Mar 31, etc.)
@@ -236,7 +301,7 @@ carry the most business weight and should lead the report:
 Step 3c: Analyze pre-merge verification activity
 
 ```bash
-./hack/tools/scripts/analyze-pr-verifications.py <GITHUB_USERNAME> <START_DATE> <END_DATE> -o /tmp/pr_verifications.json
+./hack/tools/scripts/analyze-pr-verifications.py <GITHUB_USERNAME> <START_DATE> <END_DATE> -o "$STATE_DIR/pr_verifications.json"
 ```
 
 This script outputs JSON with:
@@ -405,7 +470,7 @@ If neither escalations nor features dominate, fall back to the default ordering
 - **Total Cross-Repo PRs:** XX (YY% of core team's ZZ cross-repo PRs)
 - **Repos:** [list repos where commits were found, e.g. hypershift, release, enhancements]
 - **Date Range:** July 1 - September 30, 2025
-- **Core Team Average:** ZZ commits (from /tmp/team_stats.json)
+- **Core Team Average:** ZZ commits (from $STATE_DIR/team_stats.json)
 - **Primary Focus Areas:** [List 3-5 main areas]
 
 ### Commits by Topic
@@ -518,7 +583,7 @@ Notable transitions:
 - **Cross-Verifications (others' PRs):** XX (XX%)
 - **Self-Verifications:** XX (XX%)
 - **With Substantive Explanation:** XX (XX%)
-- **Core Team Average:** ZZ verifications (from /tmp/team_stats.json)
+- **Core Team Average:** ZZ verifications (from $STATE_DIR/team_stats.json)
 - **Teammates Verified:** [list of GitHub usernames whose PRs were verified]
 
 ### Verification Quality Breakdown
@@ -553,7 +618,7 @@ Notable transitions:
 - **Repositories Covered:** X (repo1, repo2, repo3)
 - **Review Period:** Q3 2025
 - **Unique Contributors:** XX developers
-- **Core Team Average:** ZZ reviews (from /tmp/team_stats.json)
+- **Core Team Average:** ZZ reviews (from $STATE_DIR/team_stats.json)
 
 ### Review Depth Analysis
 

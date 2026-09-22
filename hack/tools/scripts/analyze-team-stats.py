@@ -176,6 +176,25 @@ def discover_sibling_repos(
     return siblings
 
 
+def _git_common_dir(repo_path: Optional[str]) -> Optional[str]:
+    """Return the resolved git *common* directory for a repo (or worktree).
+
+    A git worktree shares its object store and commit history with its main
+    clone; both report the same --git-common-dir. Using this to dedup repos
+    prevents scanning the same history twice (e.g. an analysis worktree living
+    beside the primary clone), which would otherwise double-count every commit.
+    """
+    cmd = ["git"]
+    if repo_path:
+        cmd.extend(["-C", repo_path])
+    cmd.extend(["rev-parse", "--git-common-dir"])
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    base = repo_path if repo_path else os.getcwd()
+    return os.path.realpath(os.path.join(base, result.stdout.strip()))
+
+
 def _shortlog_counts(
     repo_path: Optional[str], start_date: str, end_date: str,
 ) -> List[Tuple[int, str, str]]:
@@ -241,7 +260,18 @@ def collect_commits(
 
     print(f"  Scanning {len(repos_to_scan)} repos: {', '.join(r[0] for r in repos_to_scan)}", file=sys.stderr)
 
+    # Dedup by git common directory so a worktree of an already-scanned repo is
+    # skipped rather than counted a second time (see _git_common_dir).
+    seen_common_dirs: Set[str] = set()
+
     for repo_name, repo_path in repos_to_scan:
+        common_dir = _git_common_dir(repo_path)
+        if common_dir is not None:
+            if common_dir in seen_common_dirs:
+                print(f"    {repo_name}: skipped (shares git history with an already-scanned repo)", file=sys.stderr)
+                continue
+            seen_common_dirs.add(common_dir)
+
         # Fetch origin for siblings to ensure we have recent commits
         if repo_path:
             subprocess.run(
@@ -330,6 +360,64 @@ def collect_cross_repo_prs(
     return by_user, all_repo_names
 
 
+def state_dir() -> str:
+    """XDG state directory for quarterly-analysis intermediate files."""
+    base = os.getenv("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    path = os.path.join(base, "quarterly-analysis")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def ensure_bot_attribution(
+    cache_path: str, roster_path: str, start: str, end: str, overrides: Optional[str],
+) -> str:
+    """Ensure a bot-attribution JSON exists at cache_path, generating it if needed.
+
+    Bot-driven PRs (Chai Bot, jira-solve-bot) are authored by a bot account, so the
+    author-keyed cross-repo PR search misses them. We always fold them in; if a
+    precomputed file was not supplied, run the sibling attribution script to build one.
+    Returns the path to the attribution JSON.
+    """
+    if cache_path and os.path.isfile(cache_path):
+        print(f"  Reusing bot attribution: {cache_path}", file=sys.stderr)
+        return cache_path
+
+    out_path = cache_path or os.path.join(state_dir(), "chai_bot_attr.json")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyze-chai-bot-attribution.py")
+    if not os.path.isfile(script):
+        print(f"Error: attribution script not found at {script}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [sys.executable, script, roster_path, start, end, "-o", out_path]
+    if overrides:
+        cmd.extend(["--overrides", overrides])
+    print(f"  Generating bot attribution → {out_path}", file=sys.stderr)
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0 or not os.path.isfile(out_path):
+        print("Error: bot attribution generation failed", file=sys.stderr)
+        sys.exit(1)
+    return out_path
+
+
+def load_bot_attribution(path: str, core_team: Set[str]) -> Dict[str, Any]:
+    """Load resolved bot-driven PR counts, restricted to roster/core-team members."""
+    with open(path) as f:
+        data = json.load(f)
+
+    core_lower = {u.lower() for u in core_team}
+    by_user: Dict[str, int] = {}
+    for rec in data.get("resolved", []):
+        gh = rec.get("github")
+        if gh and gh.lower() in core_lower:
+            by_user[gh] = by_user.get(gh, 0) + 1
+
+    return {
+        "by_user": by_user,
+        "total": sum(by_user.values()),
+        "resolved": data.get("summary", {}).get("resolved", 0),
+    }
+
+
 REVIEW_COUNT_QUERY = """
 query($searchQuery: String!) {
   search(query: $searchQuery, type: ISSUE, first: 1) {
@@ -389,6 +477,45 @@ async def collect_reviews_graphql(
     return {
         "core_team": {"total": core_total, "by_user": core_by_user},
         "all_contributors": {"total": core_total, "by_user": core_by_user},
+    }
+
+
+def collect_reviews_classified(
+    token: str, start_date: str, end_date: str, core_team: Set[str],
+) -> Dict[str, Any]:
+    """Collect accurate PR review counts for the core team.
+
+    Uses the same classifier as the per-developer report (analyze_pr_reviews),
+    so the team-wide denominator is comparable to each member's count: genuine
+    reviews of others' PRs (formal review, inline comment, /lgtm|/approve, or
+    substantive prose) on team-relevant repos, dated in-window — excluding
+    own-PR self-comments and bare Prow/CI slash-commands (/override, /retest…).
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import analyze_pr_reviews  # noqa: E402
+
+    print(f"  Collecting classified PR reviews for {len(core_team)} core members...",
+          file=sys.stderr)
+    by_user: Dict[str, int] = {}
+    members = sorted(core_team)
+    for i, user in enumerate(members, 1):
+        if i % 5 == 0:
+            print(f"    {i}/{len(members)}...", file=sys.stderr)
+        try:
+            res = analyze_pr_reviews.classify_user(token, user, start_date, end_date)
+            n = res["counts"].get("review", 0)
+            if n:
+                by_user[user] = n
+        except Exception as e:  # keep going; one bad user shouldn't sink the run
+            print(f"    Warning: review classification failed for {user}: {e}",
+                  file=sys.stderr)
+
+    total = sum(by_user.values())
+    print(f"  PR reviews (classified): {total} total across core team", file=sys.stderr)
+    return {
+        "method": "classified-v2",
+        "core_team": {"total": total, "by_user": dict(sorted(by_user.items(), key=lambda kv: -kv[1]))},
+        "all_contributors": {"total": total, "by_user": dict(sorted(by_user.items(), key=lambda kv: -kv[1]))},
     }
 
 
@@ -564,6 +691,18 @@ Environment variables:
         "--owners-aliases",
         help="Path to OWNERS_ALIASES file (default: auto-detect in sibling hypershift/ dir)",
     )
+    parser.add_argument(
+        "--roster",
+        help="Path to roster YAML (used to attribute bot-driven PRs; required to auto-generate attribution)",
+    )
+    parser.add_argument(
+        "--bot-attribution",
+        help="Path to a precomputed bot-attribution JSON to reuse (default: XDG state dir; auto-generated if absent)",
+    )
+    parser.add_argument(
+        "--overrides",
+        help="Path to bot-attribution overrides JSON (passed through when auto-generating attribution)",
+    )
     parser.add_argument("-o", "--output", help="Output file path (default: stdout)")
 
     args = parser.parse_args()
@@ -603,9 +742,45 @@ Environment variables:
         args.start_date, args.end_date, core_team, username_to_email, cross_repo_names
     )
 
-    # Add cross-repo PR counts to output
+    # Bot-driven PRs (Chai Bot, jira-solve-bot) are authored by a bot account, so the
+    # author-keyed search above misses them entirely. Always attribute them back to the
+    # human driver and fold them into each member's cross-repo PR count.
+    authored_prs = dict(cross_repo_prs)
+    combined_prs = dict(cross_repo_prs)
+    bot_attr: Dict[str, Any] = {"by_user": {}, "total": 0, "resolved": 0}
+    attr_source: Optional[str] = None
+    if args.bot_attribution and os.path.isfile(args.bot_attribution):
+        attr_source = args.bot_attribution
+    elif args.roster and os.path.isfile(args.roster):
+        attr_source = ensure_bot_attribution(
+            args.bot_attribution or "", args.roster, args.start_date, args.end_date, args.overrides
+        )
+    else:
+        print(
+            "Warning: no --bot-attribution file and no --roster to generate one; "
+            "bot-driven PRs will NOT be attributed",
+            file=sys.stderr,
+        )
+
+    if attr_source:
+        bot_attr = load_bot_attribution(attr_source, core_team)
+        for user, cnt in bot_attr["by_user"].items():
+            combined_prs[user] = combined_prs.get(user, 0) + cnt
+        print(
+            f"  Bot-driven PRs folded in: {bot_attr['total']} across core team", file=sys.stderr
+        )
+
+    # Add cross-repo PR counts to output. `core_team` is the combined figure (authored +
+    # bot-driven) so downstream consumers get the full picture; the split is preserved.
     commits["cross_repo_prs"] = {
-        "core_team": {"total": sum(cross_repo_prs.values()), "by_user": cross_repo_prs},
+        "core_team": {"total": sum(combined_prs.values()), "by_user": combined_prs},
+        "authored": {"total": sum(authored_prs.values()), "by_user": authored_prs},
+        "bot_driven": {
+            "total": bot_attr["total"],
+            "by_user": bot_attr["by_user"],
+            "source": attr_source,
+            "resolved": bot_attr["resolved"],
+        },
     }
 
     # Collect reviews and verifications via GraphQL
@@ -615,8 +790,8 @@ Environment variables:
         reviews = {"core_team": {"total": 0, "by_user": {}}, "all_contributors": {"total": 0, "by_user": {}}}
         verifications = {"repos": VERIFICATION_REPOS, "core_team": {"total": 0, "by_user": {}}, "all_contributors": {"total": 0, "by_user": {}}}
     elif HAS_AIOHTTP:
-        reviews = asyncio.run(
-            collect_reviews_graphql(token, args.start_date, args.end_date, core_team)
+        reviews = collect_reviews_classified(
+            token, args.start_date, args.end_date, core_team
         )
         verifications = asyncio.run(
             collect_verifications_graphql(token, args.start_date, args.end_date, core_team)
@@ -649,7 +824,14 @@ Environment variables:
     print(f"Period: {args.start_date} to {args.end_date}", file=sys.stderr)
     print(f"Core team members: {len(core_team)}", file=sys.stderr)
     print(f"Local commits: {commits['core_team']['total']} (core) / {commits['all_contributors']['total']} (all)", file=sys.stderr)
-    print(f"Cross-repo PRs: {commits.get('cross_repo_prs', {}).get('core_team', {}).get('total', 0)} (core)", file=sys.stderr)
+    xr = commits.get("cross_repo_prs", {})
+    combined_total = xr.get("core_team", {}).get("total", 0)
+    authored_total = xr.get("authored", {}).get("total", 0)
+    bot_total = xr.get("bot_driven", {}).get("total", 0)
+    print(
+        f"Cross-repo PRs: {combined_total} (core) = {authored_total} authored + {bot_total} bot-driven",
+        file=sys.stderr,
+    )
     print(f"PR reviews: {reviews['core_team']['total']} (core)", file=sys.stderr)
     print(f"Verifications: {verifications['core_team']['total']} (core)", file=sys.stderr)
 

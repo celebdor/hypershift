@@ -184,11 +184,15 @@ The tool uses three helper scripts:
    - Fetches your cross-repository PRs via GitHub API
    - Includes rate limiting to avoid API throttling
 
-3. **Review Analysis** (`hack/tools/scripts/analyze-pr-reviews.sh`)
-   - Finds all PRs you reviewed across repositories
-   - Filters by actual review submission date
-   - Extracts comments, suggestions, and review states
-   - Handles GitHub API rate limits gracefully
+3. **Review Analysis** (`hack/tools/scripts/analyze_pr_reviews.py`)
+   - Gathers your entire quarter of PR engagement in bulk via GraphQL (reviews and
+     conversation comments inlined per PR), then classifies each PR locally
+   - Counts genuine reviews of others' PRs — formal reviews, inline comments,
+     `/lgtm`/`/approve`, or substantive prose — dated in-window
+   - Excludes own PRs, bare Prow/CI slash-commands (`/override`, `/retest`, …),
+     and personal/off-team repos, so counts are comparable to the team denominator
+   - Importable as a module (`review classifier`) so `analyze-team-stats.py` computes
+     the team-wide review total with the identical methodology
 
 The Claude Code command orchestrates these scripts, analyzes the data, categorizes contributions, and generates a comprehensive markdown report.
 
