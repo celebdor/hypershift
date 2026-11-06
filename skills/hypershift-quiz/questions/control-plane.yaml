@@ -1,0 +1,281 @@
+# Control plane (CPO / CPOv2) questions. Schema: skills/hypershift-quiz/SKILL.md
+- id: cpo-role
+  topic: control-plane
+  depth: 1
+  format: mcq
+  question: |
+    What does the Control Plane Operator (CPO) do, and how many instances
+    of it run?
+  options:
+    - text: Reconciles the HostedControlPlane and manages roughly 40 control plane components; one CPO instance per hosted cluster, in its control plane namespace
+      correct: true
+    - text: Manages HostedClusters fleet-wide; a singleton in the hypershift namespace
+      correct: false
+    - text: Runs on each worker node as a static pod
+      correct: false
+    - text: Replaces the OpenShift cluster-version-operator for the management cluster
+      correct: false
+  source: ARCHITECTURE.md
+  why: |
+    The HyperShift Operator is the singleton; the CPO is per-hosted-cluster
+    and lives in the control plane namespace next to the components it
+    manages. Its main controller is
+    control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go.
+
+- id: cpo-kas-independent
+  topic: control-plane
+  depth: 2
+  format: mcq
+  question: |
+    Which of these components reconcile WITHOUT waiting for the
+    kube-apiserver to be available? (Select all that apply.)
+  options:
+    - text: etcd
+      correct: true
+    - text: PKI operator
+      correct: true
+    - text: kube-controller-manager
+      correct: false
+    - text: cluster-version-operator
+      correct: false
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    In the component dependency graph, etcd, the PKI operator, the
+    featuregate generator, and the router have no KAS dependency; KAS is an
+    implicit dependency for nearly everything else (KCM, CVO, oauth,
+    openshift-apiserver, ...). Registration order does not determine
+    startup order — dependencies do.
+
+- id: cpo-status-flow
+  topic: control-plane
+  depth: 2
+  format: mcq
+  question: |
+    How does the health of an individual control plane component reach the
+    user-visible HostedCluster status?
+  options:
+    - text: Component conditions feed the HCP status, and the HyperShift Operator aggregates HCP status into HC status conditions (Available, Progressing, Degraded)
+      correct: true
+    - text: Components write directly into the HostedCluster status
+      correct: false
+    - text: The HyperShift Operator polls component pods over the network
+      correct: false
+    - text: The CPO exports metrics that the HO scrapes to build status
+      correct: false
+  source: docs/content/getting-started/onboarding/lifecycle.md
+  why: |
+    The status chain is ControlPlaneComponent CRs (Available,
+    RolloutComplete) → HCP status (EtcdAvailable, KubeAPIServerAvailable,
+    ...) → HC status (Available, Progressing, Degraded). Each layer only
+    knows the one below it — the CPO never touches HC status directly.
+
+- id: cpo-builder
+  topic: control-plane
+  depth: 2
+  format: explain
+  question: |
+    Explain the CPOv2 component builder pattern: what do WithPredicate and
+    WithDependencies control, and what do the two resulting
+    ControlPlaneComponent conditions mean?
+  rubric:
+    must_cover:
+      - WithPredicate decides whether the component is enabled at all (based on the HCP configuration)
+      - WithDependencies blocks reconciliation until the named dependencies are ready (most components depend on kube-apiserver)
+      - ControlPlaneComponentAvailable means at least one pod of the component is ready
+      - ControlPlaneComponentRolloutComplete means all pods are at the desired version
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    The builder lives in support/controlplane-component/builder.go and the
+    dependency/condition logic in status.go. A component whose predicate
+      fails gets its resources deleted; one whose dependencies are not ready
+    is skipped and requeued — knowing this makes "component never deployed"
+    debuggable in one look.
+
+- id: cpo-component-stuck
+  topic: control-plane
+  depth: 3
+  format: scenario
+  question: |
+    A new hosted cluster's control plane is up, but one component's
+    Deployment never seems to be created at all — no pods, no errors in the
+    CPO log beyond requeues. Where do you look to find out why it is being
+    skipped, and what are the two usual causes?
+  rubric:
+    must_cover:
+      - Check the ControlPlaneComponent CR's conditions and the component's configured dependencies
+      - Cause one — the component's predicate fails (disabled by configuration), in which case its resources are deliberately deleted/not created
+      - Cause two — its dependencies are not ready, so it is skipped and requeued (usually waiting on the etcd → kube-apiserver chain)
+      - Registration order does not determine startup order — dependency readiness does
+  source: docs/content/getting-started/onboarding/lifecycle.md
+  why: |
+    "Never deployed" is usually not a bug but the framework working as
+    designed. The component reconcile loop (predicate → dependencies →
+    manifests) is in the lifecycle doc's flowchart and in
+    support/controlplane-component/controlplane-component.go.
+
+- id: cpo-register-components
+  topic: control-plane
+  depth: 3
+  format: code
+  question: |
+    Open control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
+    and find registerComponents(). What does the list built here determine,
+    and what does the order of registration NOT imply?
+  rubric:
+    must_cover:
+      - It determines the full set of control plane components the CPO will reconcile for the hosted cluster
+      - Registration order does not determine startup order — components reconcile when their dependencies are ready
+  source: control-plane-operator/controllers/hostedcontrolplane/hostedcontrolplane_controller.go
+  why: |
+    registerComponents is the table of contents for the entire control
+    plane: every component name there maps to a package under
+    control-plane-operator/controllers/hostedcontrolplane/v2/. Pick one
+    simple component (kube-scheduler) and one complex one (kas) and compare
+    them to see how the framework scales.
+
+- id: cpo-component-zoo
+  topic: control-plane
+  depth: 1
+  format: explain
+  question: |
+    The CPO manages roughly 40 control plane components. Name four of them,
+    and name the component that almost all of the others implicitly wait
+    for — plus the one it depends on.
+  rubric:
+    must_cover:
+      - Any four of etcd, kube-apiserver, kube-controller-manager, kube-scheduler, openshift-apiserver, CVO, oauth-server, konnectivity, ingress-operator, machine-approver, and so on
+      - kube-apiserver is the implicit dependency almost every other component waits for
+      - kube-apiserver itself depends on etcd
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    The dependency shape (etcd, then KAS, then everything else, with PKI,
+    featuregate-generator and router off to the side) is the mental model
+    for both startup ordering and debugging — components "not deploying"
+    are usually just waiting on this chain.
+
+- id: cpo-kube-scheduler-pattern
+  topic: control-plane
+  depth: 1
+  format: code
+  question: |
+    List the contents of control-plane-operator/controllers/hostedcontrolplane/v2/kube_scheduler/
+    and describe the pattern — what are the pieces that make up a CPOv2
+    component?
+  rubric:
+    must_cover:
+      - A component.go (or similar) defines the component using the CPOv2 builder
+      - Supporting files own the pieces the component manages (config, deployment, kubeconfig, service monitor)
+      - The component is registered in registerComponents() and its workload manifests are reconciled by the framework
+  source: control-plane-operator/controllers/hostedcontrolplane/v2/kube_scheduler
+  why: |
+    kube-scheduler is the "hello world" of CPOv2 components — compare it
+    with v2/kas to see how the same pattern scales from a single static
+    Deployment to a component with dozens of supporting resources. The
+    onboarding doc suggests exactly this reading order.
+
+- id: cpo-kas-down
+  topic: control-plane
+  depth: 1
+  format: scenario
+  question: |
+    A hosted cluster's kube-apiserver pod is crashlooping. At a high level,
+    which other control plane components do you expect to be unhappy, which
+    keep running fine, and where do you look to see the blast radius?
+  rubric:
+    must_cover:
+      - Almost all components implicitly depend on kube-apiserver, so most will be unavailable or waiting (kube-controller-manager, scheduler, CVO, oauth, openshift-apiserver, and the rest)
+      - etcd, the PKI operator, the featuregate generator and the router do not depend on KAS and keep running
+      - Look at the ControlPlaneComponent CR conditions and the HCP/HC status conditions to see what is affected
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    KAS-down has a characteristic blast radius: everything downstream
+    waits while the foundation (etcd, PKI) keeps working — which is exactly
+    what lets the CPO bring the control plane back without a full restart.
+
+- id: cpo-data-plane-subcommand
+  topic: control-plane
+  depth: 1
+  format: mcq
+  question: |
+    The control-plane-operator image also ships a component that runs on
+    worker nodes as a static pod. Which one?
+  options:
+    - text: kubernetes-default-proxy, an HTTP CONNECT proxy for KAS traffic when spec.configuration.proxy is set
+      correct: true
+    - text: The ignition server
+      correct: false
+    - text: The CAPI provider controllers
+      correct: false
+    - text: machine-approver
+      correct: false
+  source: ARCHITECTURE.md
+  why: |
+    Despite sharing the CPO container image, these are data-plane
+    components. The image for the kubernetes-default-proxy static pod is
+    resolved from the HC release image — which means CP-only upgrades can
+    cause a config hash change and node rollout for clusters using the
+    proxy path. A classic gotcha.
+
+- id: cpo-why-status-patching
+  topic: control-plane
+  depth: 3
+  format: explain
+  question: |
+    HyperShift actively forbids Status().Update() and unguarded
+    client.MergeFrom() on HostedCluster and HostedControlPlane status. Why?
+    What goes wrong with a plain status update, and what do the
+    support/statuspatching helpers do instead?
+  rubric:
+    must_cover:
+      - Many controllers write HC/HCP status concurrently (HO, CPO, per-component logic)
+      - A full-object Status().Update() overwrites the whole status, so concurrent writers lose each other's conditions (lost updates)
+      - The statuspatching helpers re-fetch the object, apply the mutation, and patch with optimistic locking (MergeFromWithOptimisticLock) so only the intended fields change
+      - The rule is actively enforced by the hcpstatuspatch check
+  source: control-plane-operator/AGENTS.md
+  why: |
+    Status is the product of many writers racing; patching with optimistic
+    lock makes each writer's change additive instead of destructive. Use
+    statuspatching.PatchStatus or PatchStatusCondition — never a raw
+    update.
+
+- id: cpo-check-dependencies
+  topic: control-plane
+  depth: 2
+  format: code
+  question: |
+    Open support/controlplane-component/status.go and find
+    checkDependencies. What does it do, what does it return, and how does
+    its result affect a component's reconcile?
+  rubric:
+    must_cover:
+      - It starts from the component's declared dependencies and always adds kube-apiserver implicitly for every component except etcd
+      - It removes etcd as a dependency for unmanaged control planes (where the CPO does not deploy etcd)
+      - A dependency counts as ready only when its ControlPlaneComponent CR is both Available and RolloutComplete at the desired version
+      - It returns the list of still-unavailable dependencies; a non-empty list means the component is skipped and requeued rather than reconciled
+  source: support/controlplane-component/status.go
+  why: |
+    checkDependencies is the engine of the CPOv2 dependency graph — and
+    note the implicit KAS rule, which is why "almost everything depends on
+    kube-apiserver" without every component saying so. When a component
+    never deploys, this function's return value is usually the answer.
+
+- id: cpo-mid-rollout
+  topic: control-plane
+  depth: 2
+  format: scenario
+  question: |
+    During a control plane upgrade, the oauth-server component shows
+    Available=True but RolloutComplete=False, and a user reports the
+    console logged them out briefly. Is this an incident? Explain what the
+    two conditions mean together.
+  rubric:
+    must_cover:
+      - Available=True means at least one pod is ready and serving
+      - RolloutComplete=False means not all pods are at the desired version yet — old and new pods coexist mid-rollout
+      - That combination is the normal state during a rolling upgrade, not an incident
+      - Concern is warranted only if it persists (rollout stalls) or conditions flip to unhealthy/Degraded
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    Reading the two conditions together is the skill: Available answers
+    "is it serving", RolloutComplete answers "is the upgrade done". One
+    true and one false simply means in progress.

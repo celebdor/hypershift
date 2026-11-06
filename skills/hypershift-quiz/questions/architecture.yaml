@@ -1,0 +1,263 @@
+# Architecture questions. Schema and conventions: skills/hypershift-quiz/SKILL.md
+- id: arch-where-cp-runs
+  topic: architecture
+  depth: 1
+  format: mcq
+  question: |
+    Where do the control plane components of a hosted cluster (etcd,
+    kube-apiserver, kube-controller-manager, ...) run?
+  options:
+    - text: As pods in a dedicated namespace on the management cluster
+      correct: true
+    - text: As pods in the clusters namespace, next to the HostedCluster CR
+      correct: false
+    - text: Directly on the hosted cluster's worker nodes, alongside user workloads
+      correct: false
+    - text: As virtual machines in the hosted cluster's infrastructure
+      correct: false
+  source: docs/content/getting-started/onboarding/key-concepts.md
+  why: |
+    HyperShift decouples the control plane from the data plane: the control
+    plane runs as pods in a dedicated namespace on the management cluster,
+    while worker nodes run only user workloads in separate infrastructure.
+    This is what makes hosted control planes cheap to host at scale and
+    portable across clouds.
+
+- id: arch-hc-vs-hcp
+  topic: architecture
+  depth: 1
+  format: mcq
+  question: |
+    Which statement about the HostedCluster (HC) and HostedControlPlane (HCP)
+    resources is correct?
+  options:
+    - text: HC is the user-facing CR in the user's namespace; HCP is created by the HC controller and lives in the control plane namespace
+      correct: true
+    - text: Both live in the control plane namespace; HC is created by the CPO
+      correct: false
+    - text: HCP is the user-facing CR; HC is internal to the control plane
+      correct: false
+    - text: HC lives in the hypershift namespace next to the HyperShift Operator
+      correct: false
+  source: docs/content/getting-started/onboarding/key-concepts.md
+  why: |
+    HC is the API users declare intent with; the HyperShift Operator
+    translates it into an HCP in the control plane namespace, and the CPO
+    reads the HCP to know what to deploy. HCP is internal — users never
+    touch it directly.
+
+- id: arch-namespace-layout
+  topic: architecture
+  depth: 1
+  format: mcq
+  question: |
+    A user creates HostedCluster `api.example` in namespace `teams`. What is
+    the exact name of the control plane namespace the HyperShift Operator
+    creates for it?
+  options:
+    - text: teams-api-example
+      correct: true
+    - text: teams-api.example
+      correct: false
+    - text: clusters-api-example
+      correct: false
+    - text: api-example
+      correct: false
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    The control plane namespace is `{hc-namespace}-{hc-name}` with dots in
+    the hosted cluster name replaced by dashes, because dots are not valid
+    in namespace names. The helper lives in
+    hypershift-operator/controllers/manifests/manifests.go.
+
+- id: arch-unidirectional
+  topic: architecture
+  depth: 2
+  format: explain
+  question: |
+    Explain the design invariant "communication between the management
+    cluster and a hosted cluster is unidirectional". What is allowed, from
+    where, and what does it imply about what a hosted cluster can know and
+    do?
+  rubric:
+    must_cover:
+      - Communication is only allowed from within each particular control plane namespace (not from the management cluster at large)
+      - The hosted/guest cluster has no awareness of the management cluster
+      - Worker nodes run nothing beyond user workloads, and the guest cluster exposes no CRDs, CRs, or pods that let users manipulate HyperShift-owned features
+      - The invariant enables persona separation (service provider vs consumer), security, and cost efficiency
+    common_mistakes:
+      - mistake: Interpreting the invariant as a statement about network packet direction, e.g. claiming worker nodes never send traffic towards the control plane
+        correction: Worker nodes do dial the Konnectivity server and the API server endpoint. The invariant is about awareness and control relationships — the guest cluster never addresses or authenticates against the management cluster's API.
+  source: docs/content/reference/goals-and-design-invariants.md
+  why: |
+    Unidirectionality is the security backbone of HyperShift: a compromised
+    guest cluster cannot reach back into the management cluster because it
+    does not know it exists, and management-to-hosted traffic is confined to
+    the control plane namespace, enforceable with NetworkPolicies.
+
+- id: arch-namespace-func
+  topic: architecture
+  depth: 2
+  format: code
+  question: |
+    Open hypershift-operator/controllers/manifests/manifests.go and find the
+    namespace helper (the onboarding docs call it HostedControlPlaneNamespace;
+    find the actual function). What is the control plane namespace for
+    HostedCluster `api.example` in namespace `teams`, and what does the
+    function do to the name?
+  rubric:
+    must_cover:
+      - The namespace is teams-api-example
+      - The format is {hc-namespace}-{hc-name}
+      - Dots in the hosted cluster name are replaced with dashes
+  source: hypershift-operator/controllers/manifests/manifests.go
+  why: |
+    Naming helpers in manifests.go are used everywhere in the codebase;
+    knowing them makes logs and namespaces instantly decodable. Note the
+    doc name and the code name have drifted (HostedControlPlaneNamespace
+    vs HostedControlPlaneNamespaceObject) — a small live example of why
+    this quiz cites symbols, not line numbers.
+
+- id: arch-no-guest-crds
+  topic: architecture
+  depth: 3
+  format: scenario
+  question: |
+    A user with cluster-admin on their hosted cluster wants to scale up their
+    NodePool and asks you where to find the NodePool CR "in their cluster".
+    What do you tell them, and why is it designed this way?
+  rubric:
+    must_cover:
+      - The NodePool lives in the management cluster (in the user's namespace there), not inside the guest cluster
+      - The guest cluster deliberately exposes no HyperShift CRDs, CRs, or pods that would let users manipulate HyperShift-owned features
+      - Worker nodes run only user workloads; HyperShift resources belong to whoever operates the management cluster
+      - This separates the personas — the consumer owns workload capacity usage, the service provider owns the hosting machinery
+  source: docs/content/reference/goals-and-design-invariants.md
+  why: |
+    This trips up nearly everyone coming from standalone OpenShift. The
+    guest cluster's API is for user workloads only; cluster lifecycle is
+    expressed on the management cluster via HostedCluster and NodePool CRs.
+
+- id: arch-three-resources
+  topic: architecture
+  depth: 1
+  format: explain
+  question: |
+    Name the three custom resources at the heart of every hosted cluster and
+    give a one-line role for each.
+  rubric:
+    must_cover:
+      - HostedCluster (HC) — the user-facing CR declaring the intent to create a cluster, living in the user's namespace
+      - HostedControlPlane (HCP) — internal CR created by the HC controller in the control plane namespace; the CPO reads it to know what to deploy
+      - NodePool (NP) — user-facing CR defining a scalable set of worker nodes that references a HostedCluster
+  source: docs/content/getting-started/onboarding/key-concepts.md
+  why: |
+    HC, HCP, and NodePool are the nouns of every HyperShift conversation.
+    Knowing who creates each one and which namespace it lives in decodes
+    most logs and status output you will ever read.
+
+- id: arch-release-field
+  topic: architecture
+  depth: 1
+  format: code
+  question: |
+    Open api/hypershift/v1beta1/hostedcluster_types.go and find the spec
+    field that points at the release image. What does it reference, and in
+    one sentence, what happens when you change it?
+  rubric:
+    must_cover:
+      - spec.release.image — the OCP release image (payload) the hosted cluster's control plane runs
+      - Changing it upgrades the control plane — the HO updates the HCP and the CPO rolls out new component versions
+  source: api/hypershift/v1beta1/hostedcluster_types.go
+  why: |
+    spec.release.image is the control plane's source of truth for versions.
+    The HO copies it into the HCP's releaseImage (see
+    hostedcluster_controller.go), and the CPO resolves component images from
+    that payload. NodePool releases are separate — that is the decoupling.
+
+- id: arch-two-clusters
+  topic: architecture
+  depth: 1
+  format: scenario
+  question: |
+    A teammate wants to create a hosted cluster for their team and asks:
+    which OpenShift cluster do I create it on, and which one will the team
+    point kubectl at? What do you tell them?
+  rubric:
+    must_cover:
+      - The HostedCluster (and NodePool) CRs are created on the management cluster
+      - The team points kubectl at the hosted cluster's own API endpoint, not the management cluster
+      - Users get a kubeconfig that the HO copies into their namespace once the control plane is available
+  source: docs/content/getting-started/onboarding/key-concepts.md
+  why: |
+    Two clusters, two audiences: the management cluster is where hosting is
+    declared, the hosted cluster is what consumers use. The kubeconfig
+    Secret appearing in the user's namespace is the bridge between them.
+
+- id: arch-resources-vs-pods
+  topic: architecture
+  depth: 2
+  format: mcq
+  question: |
+    HostedCluster `my.cluster` exists in namespace `teams`. Where do its
+    NodePool CRs live, and where does its kube-apiserver pod run?
+  options:
+    - text: NodePool CRs in teams; kube-apiserver pod in teams-my-cluster
+      correct: true
+    - text: NodePool CRs in teams-my-cluster; kube-apiserver pod in teams
+      correct: false
+    - text: Both in the hypershift namespace
+      correct: false
+    - text: NodePool CRs in the guest cluster; kube-apiserver pod in teams-my-cluster
+      correct: false
+  source: docs/content/getting-started/onboarding/architecture.md
+  why: |
+    User-facing CRs (HC, NP) stay in the user's namespace; everything the
+    CPO runs lives in the control plane namespace {hc-ns}-{hc-name} with
+    dots replaced by dashes. Mixed-up namespaces are the number one
+    first-week confusion.
+
+- id: arch-tenant-isolation
+  topic: architecture
+  depth: 2
+  format: scenario
+  question: |
+    Two hosted clusters share one management cluster. A new engineer asks
+    what keeps cluster A's control plane from talking to cluster B's, and
+    whether a compromised cluster A control plane could reach the
+    management cluster at large. What do you tell them?
+  rubric:
+    must_cover:
+      - Each hosted cluster gets its own control plane namespace, and communication is only allowed from within each particular control plane namespace
+      - NetworkPolicies fence each control plane namespace (deny by default, only the needed published ports opened)
+      - A control plane pod cannot freely reach the management cluster's API or other namespaces
+      - The hosted clusters remain unaware of each other — no cross-tenant path exists through the guest clusters either
+  source: docs/content/reference/goals-and-design-invariants.md
+  why: |
+    Namespace-per-cluster plus NetworkPolicies is the multi-tenant blast
+    radius control on the management cluster. The invariant "only from
+    within each control plane namespace" is enforced by the policies
+    generated in hypershift-operator/controllers/hostedcluster/network_policies.go.
+
+- id: arch-invariant-mcq
+  topic: architecture
+  depth: 3
+  format: mcq
+  question: |
+    Which of these is a stated HyperShift design invariant?
+  options:
+    - text: HyperShift components should not own or manage user infrastructure platform credentials
+      correct: true
+    - text: Worker nodes must run a HyperShift agent for manageability
+      correct: false
+    - text: The hosted cluster must be able to reach the management cluster API for upgrades
+      correct: false
+    - text: Control plane components must run in the hypershift namespace for isolation
+      correct: false
+  source: docs/content/reference/goals-and-design-invariants.md
+  why: |
+    The real invariants: unidirectional management-to-hosted communication
+    (the guest has no awareness of the management cluster), communication
+    only from within each control plane namespace, workers run only user
+    workloads, and no ownership of user platform credentials. Each
+    distractor inverts or fabricates one of them.
