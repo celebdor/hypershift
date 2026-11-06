@@ -425,6 +425,7 @@ nav:
       - '4.12': reference/manifests/ibmcloud/4.12.md
       - '4.13': reference/manifests/ibmcloud/4.13.md
   - reference/multi-platform-support.md
+  - 'NodePool InPlace Trust Bundle Activation': reference/nodepool-inplace-trust-bundle.md
   - 'NodePool Rollouts': reference/nodepool-rollouts.md
   - 'NodePool Rollout State Machine': reference/nodepool-rollout-state-machine.md
   - 'Openshift behaviour deviations':

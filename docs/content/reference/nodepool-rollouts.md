@@ -131,6 +131,13 @@ InPlace upgrades update the operating system of existing Node instances without 
 
     When using InPlace upgrades, platform-specific machine template changes (e.g. instance type, AMI) will **only apply to new Nodes** that are created after the change. Existing Nodes are not affected by platform changes.
 
+!!! warning "Trust bundle changes on InPlace NodePools"
+
+    A trust-bundle content change applied through an InPlace update is written to
+    the node but is not activated until the node is rebooted. See
+    [NodePool InPlace Trust Bundle Activation](nodepool-inplace-trust-bundle.md)
+    for the current behavior, impact, and verification steps.
+
 ## Rollout Lifecycle
 
 When a rollout is triggered, the controller follows this sequence:
