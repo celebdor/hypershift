@@ -159,6 +159,7 @@ nav:
   - how-to/feature-gates.md
   - 'HyperShift Operator Install':
     - how-to/install/index.md
+  - 'Patching the Control Plane': how-to/control-plane-release.md
   - how-to/pause-reconciliation.md
   - 'PKI and Certificates':
     - how-to/pki/index.md
